@@ -49,3 +49,59 @@ def build_reconciliation(totals: Dict[str, Optional[float]]) -> Dict[str, Option
         "derived_opening_balance": totals["derived_opening_balance"],
         "difference": None,
     }
+
+
+def reconcile(statement: Dict[str, Optional[float]], transactions: list) -> Dict[str, Optional[float]]:
+    calculated_total_debits = round(
+        sum(
+            float(tx.get("paid_out", 0.0))
+            for tx in transactions
+            if tx.get("direction") == "debit" or float(tx.get("paid_out", 0.0)) > 0
+        ),
+        2,
+    )
+    calculated_total_credits = round(
+        sum(
+            float(tx.get("paid_in", 0.0))
+            for tx in transactions
+            if tx.get("direction") == "credit" or float(tx.get("paid_in", 0.0)) > 0
+        ),
+        2,
+    )
+
+    statement_total_debits = statement.get("total_debits")
+    statement_total_credits = statement.get("total_credits")
+    closing_balance = statement.get("closing_balance")
+    derived_opening_balance = statement.get("derived_opening_balance")
+
+    if statement_total_debits is None or statement_total_credits is None:
+        return {
+            "status": "missing_totals",
+            "calculated_total_debits": calculated_total_debits,
+            "calculated_total_credits": calculated_total_credits,
+            "statement_total_debits": statement_total_debits,
+            "statement_total_credits": statement_total_credits,
+            "closing_balance": closing_balance,
+            "derived_opening_balance": derived_opening_balance,
+            "difference": None,
+        }
+
+    debit_match = abs(calculated_total_debits - statement_total_debits) <= 0.01
+    credit_match = abs(calculated_total_credits - statement_total_credits) <= 0.01
+    status = "matched" if debit_match and credit_match else "mismatch"
+    difference = round(
+        (calculated_total_debits - statement_total_debits)
+        + (calculated_total_credits - statement_total_credits),
+        2,
+    )
+
+    return {
+        "status": status,
+        "calculated_total_debits": calculated_total_debits,
+        "calculated_total_credits": calculated_total_credits,
+        "statement_total_debits": statement_total_debits,
+        "statement_total_credits": statement_total_credits,
+        "closing_balance": closing_balance,
+        "derived_opening_balance": derived_opening_balance,
+        "difference": difference,
+    }

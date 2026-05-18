@@ -1,13 +1,15 @@
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Header, HTTPException
 
 from app.models import ExtractRequest
-from app.services.bank_detector import select_parser
+from app.parsers.generic_table import GenericTableParser
+from app.parsers.santander import SantanderStatementParser
+from app.services.bank_detector import detect_bank
 from app.services.pdf_loader import download_pdf
-from app.services.reconciliation import build_reconciliation
-from app.services.text_extractor import extract_text_from_pdf
+from app.services.reconciliation import reconcile
+from app.services.text_extractor import extract_pdf_text
 
 
 PARSER_VERSION = os.getenv("PARSER_VERSION", "santander_v1.0.0")
@@ -44,50 +46,55 @@ def extract_statement(
 
     try:
         pdf_path = download_pdf(payload.file_url)
-    except Exception as exc:
+    except Exception:
         return {
             "status": "failed",
             "parser_version": PARSER_VERSION,
             "document_id": payload.document_id,
-            "error": f"Could not download PDF: {str(exc)}",
+            "error": "Could not download PDF.",
         }
 
     try:
-        page_texts, pages_debug = extract_text_from_pdf(pdf_path)
-        all_text = "\n".join(page_texts)
-        parser = select_parser(all_text, payload.bank_hint)
-        parser_result = parser.parse(all_text)
-
-        totals = parser_result["totals"]
-        reconciliation = build_reconciliation(totals)
-        bank_name = parser_result.get("bank_name") or payload.bank_hint
-
-        return {
-            "status": "success",
-            "parser_version": PARSER_VERSION,
+        extracted = extract_pdf_text(pdf_path)
+        context = {
             "document_id": payload.document_id,
-            "bank_name": bank_name,
-            "page_count": len(page_texts),
-            "statement": {
-                "currency": "GBP",
-                **totals,
-            },
-            "accounts": [],
-            "transactions": [],
-            "reconciliation": reconciliation,
-            "issues": [],
-            "parser_debug": {
-                "text_layer_detected": any(len(t) > 100 for t in page_texts),
-                "ocr_used": False,
-                "parser_used": parser_result.get("parser_used", "unknown"),
-                "pages": pages_debug,
-            },
+            "bank_hint": payload.bank_hint,
+            "original_filename": payload.original_filename,
+            "page_count": extracted["page_count"],
+            "pages": extracted["pages"],
+            "all_text": extracted["all_text"],
+            "text_layer_detected": extracted["text_layer_detected"],
         }
 
-    except Exception as exc:
+        bank = detect_bank(context["all_text"], context["bank_hint"])
+        if bank == "santander":
+            parser = SantanderStatementParser()
+            top_status = "success"
+        else:
+            parser = GenericTableParser()
+            top_status = "unsupported_bank"
+
+        parser_result = parser.parse(context)
+        reconciliation_result = reconcile(parser_result.get("statement", {}), parser_result.get("transactions", []))
+
+        return {
+            "status": top_status,
+            "parser_version": PARSER_VERSION,
+            "document_id": payload.document_id,
+            "bank_name": parser_result.get("bank_name"),
+            "page_count": extracted["page_count"],
+            "statement": parser_result.get("statement", {}),
+            "accounts": parser_result.get("accounts", []),
+            "transactions": parser_result.get("transactions", []),
+            "reconciliation": reconciliation_result,
+            "issues": parser_result.get("issues", []),
+            "parser_debug": parser_result.get("parser_debug", {}),
+        }
+
+    except Exception:
         return {
             "status": "failed",
             "parser_version": PARSER_VERSION,
             "document_id": payload.document_id,
-            "error": f"Parser failed: {str(exc)}",
+            "error": "Parser failed.",
         }
