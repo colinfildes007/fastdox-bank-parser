@@ -101,26 +101,44 @@ def extract_upload(
             "status": "failed",
             "parser_version": PARSER_VERSION,
             "document_id": document_id,
-            "error": "No file uploaded.",
+            "error": "Missing PDF file.",
         }
 
-    filename = original_filename or getattr(file, "filename", None) or ""
+    filename = original_filename or getattr(file, "filename", None) or "uploaded_statement.pdf"
     content_type = getattr(file, "content_type", "")
-    is_pdf = False
-    if content_type and content_type.lower() == "application/pdf":
-        is_pdf = True
-    if filename and filename.lower().endswith(".pdf"):
-        is_pdf = True
+    has_pdf_filename = filename.lower().endswith(".pdf")
+    has_pdf_content_type = content_type.lower() == "application/pdf"
 
-    if not is_pdf:
+    file.file.seek(0, os.SEEK_END)
+    file_size = file.file.tell()
+    if file_size == 0:
         return {
             "status": "failed",
             "parser_version": PARSER_VERSION,
             "document_id": document_id,
-            "error": "Uploaded file is not a PDF.",
+            "error": "Uploaded file is empty.",
         }
 
-    # Save to temporary file
+    file.file.seek(0)
+    header = file.file.read(5)
+    file.file.seek(0)
+
+    if not has_pdf_filename and not has_pdf_content_type:
+        if not header.startswith(b"%PDF"):
+            return {
+                "status": "failed",
+                "parser_version": PARSER_VERSION,
+                "document_id": document_id,
+                "error": "Uploaded file is not a PDF.",
+            }
+    elif not header.startswith(b"%PDF"):
+        return {
+            "status": "failed",
+            "parser_version": PARSER_VERSION,
+            "document_id": document_id,
+            "error": "Uploaded file does not appear to be a valid PDF.",
+        }
+
     tmp_file = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
@@ -130,7 +148,7 @@ def extract_upload(
         result = process_pdf_file(
             pdf_path=tmp_file,
             document_id=document_id,
-            original_filename=original_filename or filename,
+            original_filename=filename,
             bank_hint=bank_hint,
         )
 
@@ -149,8 +167,15 @@ def extract_statement(
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     require_auth(authorization)
+    pdf_path = None
     try:
         pdf_path = download_pdf(payload.file_url)
+        return process_pdf_file(
+            pdf_path=pdf_path,
+            document_id=payload.document_id,
+            original_filename=payload.original_filename,
+            bank_hint=payload.bank_hint,
+        )
     except Exception:
         return {
             "status": "failed",
@@ -158,10 +183,9 @@ def extract_statement(
             "document_id": payload.document_id,
             "error": "Could not download PDF.",
         }
-
-    return process_pdf_file(
-        pdf_path=pdf_path,
-        document_id=payload.document_id,
-        original_filename=payload.original_filename,
-        bank_hint=payload.bank_hint,
-    )
+    finally:
+        try:
+            if pdf_path and os.path.exists(pdf_path):
+                os.remove(pdf_path)
+        except Exception:
+            pass
