@@ -1,7 +1,9 @@
 import os
 from typing import Any, Dict, Optional
+import tempfile
+import shutil
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Form
 
 from app.models import ExtractRequest
 from app.parsers.generic_table import GenericTableParser
@@ -37,29 +39,13 @@ def health() -> Dict[str, Any]:
     }
 
 
-@app.post("/extract")
-def extract_statement(
-    payload: ExtractRequest,
-    authorization: Optional[str] = Header(default=None),
-) -> Dict[str, Any]:
-    require_auth(authorization)
-
-    try:
-        pdf_path = download_pdf(payload.file_url)
-    except Exception:
-        return {
-            "status": "failed",
-            "parser_version": PARSER_VERSION,
-            "document_id": payload.document_id,
-            "error": "Could not download PDF.",
-        }
-
+def process_pdf_file(pdf_path: str, document_id: str, original_filename: Optional[str], bank_hint: Optional[str]) -> Dict[str, Any]:
     try:
         extracted = extract_pdf_text(pdf_path)
         context = {
-            "document_id": payload.document_id,
-            "bank_hint": payload.bank_hint,
-            "original_filename": payload.original_filename,
+            "document_id": document_id,
+            "bank_hint": bank_hint,
+            "original_filename": original_filename,
             "page_count": extracted["page_count"],
             "pages": extracted["pages"],
             "all_text": extracted["all_text"],
@@ -80,7 +66,7 @@ def extract_statement(
         return {
             "status": top_status,
             "parser_version": PARSER_VERSION,
-            "document_id": payload.document_id,
+            "document_id": document_id,
             "bank_name": parser_result.get("bank_name"),
             "page_count": extracted["page_count"],
             "statement": parser_result.get("statement", {}),
@@ -95,6 +81,87 @@ def extract_statement(
         return {
             "status": "failed",
             "parser_version": PARSER_VERSION,
-            "document_id": payload.document_id,
+            "document_id": document_id,
             "error": "Parser failed.",
         }
+
+
+@app.post("/extract-upload")
+def extract_upload(
+    document_id: str = Form(...),
+    file: UploadFile = File(...),
+    original_filename: Optional[str] = Form(None),
+    bank_hint: Optional[str] = Form(None),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    require_auth(authorization)
+
+    if not file:
+        return {
+            "status": "failed",
+            "parser_version": PARSER_VERSION,
+            "document_id": document_id,
+            "error": "No file uploaded.",
+        }
+
+    filename = original_filename or getattr(file, "filename", None) or ""
+    content_type = getattr(file, "content_type", "")
+    is_pdf = False
+    if content_type and content_type.lower() == "application/pdf":
+        is_pdf = True
+    if filename and filename.lower().endswith(".pdf"):
+        is_pdf = True
+
+    if not is_pdf:
+        return {
+            "status": "failed",
+            "parser_version": PARSER_VERSION,
+            "document_id": document_id,
+            "error": "Uploaded file is not a PDF.",
+        }
+
+    # Save to temporary file
+    tmp_file = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_file = tmp.name
+            shutil.copyfileobj(file.file, tmp)
+
+        result = process_pdf_file(
+            pdf_path=tmp_file,
+            document_id=document_id,
+            original_filename=original_filename or filename,
+            bank_hint=bank_hint,
+        )
+
+        return result
+    finally:
+        try:
+            if tmp_file and os.path.exists(tmp_file):
+                os.remove(tmp_file)
+        except Exception:
+            pass
+
+
+@app.post("/extract")
+def extract_statement(
+    payload: ExtractRequest,
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    require_auth(authorization)
+    try:
+        pdf_path = download_pdf(payload.file_url)
+    except Exception:
+        return {
+            "status": "failed",
+            "parser_version": PARSER_VERSION,
+            "document_id": payload.document_id,
+            "error": "Could not download PDF.",
+        }
+
+    return process_pdf_file(
+        pdf_path=pdf_path,
+        document_id=payload.document_id,
+        original_filename=payload.original_filename,
+        bank_hint=payload.bank_hint,
+    )
