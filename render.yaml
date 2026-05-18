@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: fastdox-bank-parser
+    env: docker
+    repo: https://github.com/colinfildes007/fastdox-bank-parser
+    branch: main
+    dockerfilePath: Dockerfile
+    plan: free
