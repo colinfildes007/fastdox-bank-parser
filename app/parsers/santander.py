@@ -1,5 +1,4 @@
 import re
-import re
 from typing import Dict, List, Optional
 
 from app.parsers.base import BaseStatementParser
@@ -38,6 +37,8 @@ DEBIT_CLUES = [
     "standing order",
     "debit card payments",
     "monthly fee",
+    "tesco",
+    "stores",
 ]
 MONTH_MAP = {
     "jan": "01",
@@ -119,6 +120,15 @@ class SantanderStatementParser(BaseStatementParser):
             }
         )
 
+        last_transaction = transactions[-1] if transactions else None
+        response["parser_debug"]["final_page_check"] = {
+            "last_transaction_detected": bool(last_transaction),
+            "last_transaction_date": last_transaction.get("transaction_date") if last_transaction else None,
+            "last_transaction_description": last_transaction.get("description_raw") if last_transaction else None,
+            "last_transaction_amount": abs(last_transaction.get("paid_out", 0.0)) if last_transaction else None,
+            "last_transaction_balance": last_transaction.get("balance_after") if last_transaction else None,
+        }
+
         return response
 
     def _parse_transactions(self, pages: List[Dict]) -> (List[Dict], List[str]):
@@ -149,6 +159,10 @@ class SantanderStatementParser(BaseStatementParser):
                     continue
 
                 if self._is_footer_line(normalized):
+                    if current_block:
+                        blocks.append((current_page, current_block))
+                        current_block = []
+                        current_page = None
                     continue
 
                 if DATE_PATTERN.search(normalized):
@@ -160,6 +174,11 @@ class SantanderStatementParser(BaseStatementParser):
 
                 if current_block:
                     current_block.append(normalized)
+
+            if current_block:
+                blocks.append((current_page, current_block))
+                current_block = []
+                current_page = None
 
         if current_block:
             blocks.append((current_page, current_block))
@@ -225,7 +244,7 @@ class SantanderStatementParser(BaseStatementParser):
 
     def _assign_directions(self, transactions: List[Dict], issues: List[str]) -> List[Dict]:
         for index, transaction in enumerate(transactions):
-            amount = transaction.get("amount", 0.0)
+            amount = float(transaction.get("amount", 0.0))
             balance = transaction.get("balance_after")
             older_balance = None
 
@@ -237,14 +256,18 @@ class SantanderStatementParser(BaseStatementParser):
             if direction == "debit":
                 transaction["paid_out"] = amount
                 transaction["paid_in"] = 0.0
+                transaction["amount"] = -abs(amount)
             elif direction == "credit":
                 transaction["paid_in"] = amount
                 transaction["paid_out"] = 0.0
+                transaction["amount"] = abs(amount)
             else:
                 transaction["paid_out"] = 0.0
                 transaction["paid_in"] = 0.0
                 if "unknown_direction" not in issues:
                     issues.append("unknown_direction")
+
+            transaction["row_index"] = index + 1
 
         return transactions
 
