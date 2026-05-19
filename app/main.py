@@ -52,29 +52,71 @@ def process_pdf_file(pdf_path: str, document_id: str, original_filename: Optiona
             "text_layer_detected": extracted["text_layer_detected"],
         }
 
-        bank = detect_bank(context["all_text"], context["bank_hint"])
-        if bank == "santander":
+        detection = detect_bank(extracted["pages"], context["bank_hint"])
+        parser_metadata = {
+            "detected_bank": detection["detected_bank"],
+            "bank_detection_confidence": detection["bank_detection_confidence"],
+            "bank_hint": detection["bank_hint"],
+            "parser_adapter": detection["parser_adapter"],
+            "detection_evidence": detection["detection_evidence"],
+            "parser_version": PARSER_VERSION,
+            "page_count": extracted["page_count"],
+        }
+
+        if detection["status"] != "success":
+            return {
+                "status": detection["status"],
+                "detected_bank": detection["detected_bank"],
+                "bank_detection_confidence": detection["bank_detection_confidence"],
+                "bank_hint": detection["bank_hint"],
+                "parser_adapter": detection["parser_adapter"],
+                "parser_version": PARSER_VERSION,
+                "detection_evidence": detection["detection_evidence"],
+                "page_count": extracted["page_count"],
+                "transaction_count": 0,
+                "reconciliation": {
+                    "status": detection["status"],
+                    "calculated_total_debits": None,
+                    "calculated_total_credits": None,
+                    "statement_total_debits": None,
+                    "statement_total_credits": None,
+                    "closing_balance": None,
+                    "derived_opening_balance": None,
+                    "difference": None,
+                },
+                "transactions": [],
+                "parser_metadata": parser_metadata,
+                "error": detection["error"],
+            }
+
+        if detection["resolved_bank"] == "Santander":
             parser = SantanderStatementParser()
-            top_status = "success"
         else:
             parser = GenericTableParser()
-            top_status = "unsupported_bank"
 
         parser_result = parser.parse(context)
         reconciliation_result = reconcile(parser_result.get("statement", {}), parser_result.get("transactions", []))
+        parser_adapter = getattr(parser, "parser_adapter", parser.parser_name)
+        parser_metadata["parser_adapter"] = parser_adapter
 
         return {
-            "status": top_status,
+            "status": "success",
+            "detected_bank": detection["detected_bank"],
+            "bank_detection_confidence": detection["bank_detection_confidence"],
+            "bank_hint": detection["bank_hint"],
+            "parser_adapter": parser_adapter,
             "parser_version": PARSER_VERSION,
-            "document_id": document_id,
-            "bank_name": parser_result.get("bank_name"),
+            "detection_evidence": detection["detection_evidence"],
             "page_count": extracted["page_count"],
+            "transaction_count": len(parser_result.get("transactions", [])),
+            "reconciliation": reconciliation_result,
+            "transactions": parser_result.get("transactions", []),
             "statement": parser_result.get("statement", {}),
             "accounts": parser_result.get("accounts", []),
-            "transactions": parser_result.get("transactions", []),
-            "reconciliation": reconciliation_result,
             "issues": parser_result.get("issues", []),
             "parser_debug": parser_result.get("parser_debug", {}),
+            "parser_metadata": parser_metadata,
+            "bank_detection_conflict": detection.get("bank_detection_conflict", False),
         }
 
     except Exception:
