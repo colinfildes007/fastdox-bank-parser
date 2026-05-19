@@ -11,9 +11,21 @@ def extract_statement_totals(all_text: str) -> Dict[str, Optional[float]]:
     total_credits = None
     closing_balance = None
 
-    debit_match = re.search(r"Total debits\s+£([\d,]+\.\d{2})", all_text, re.IGNORECASE)
-    credit_match = re.search(r"Total credit\s+£([\d,]+\.\d{2})", all_text, re.IGNORECASE)
-    closing_match = re.search(r"Closing Balance\s+£([\d,]+\.\d{2})", all_text, re.IGNORECASE)
+    debit_match = re.search(
+        r"(?:Total debits|Total debit|Debit total)\s+£([\d,]+\.\d{2})",
+        all_text,
+        re.IGNORECASE,
+    )
+    credit_match = re.search(
+        r"(?:Total credits|Total credit|Credit total)\s+£([\d,]+\.\d{2})",
+        all_text,
+        re.IGNORECASE,
+    )
+    closing_match = re.search(
+        r"(?:Closing balance|Closing Balance|Statement balance|Statement Balance)\s+£([\d,]+\.\d{2})",
+        all_text,
+        re.IGNORECASE,
+    )
 
     if debit_match:
         total_debits = money_to_float(debit_match.group(1))

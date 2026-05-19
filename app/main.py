@@ -6,9 +6,7 @@ import shutil
 from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Form
 
 from app.models import ExtractRequest
-from app.parsers.generic_table import GenericTableParser
-from app.parsers.santander import SantanderStatementParser
-from app.services.bank_detector import detect_bank
+from app.services.bank_detector import detect_bank, select_parser
 from app.services.pdf_loader import download_pdf
 from app.services.reconciliation import reconcile
 from app.services.text_extractor import extract_pdf_text
@@ -53,6 +51,8 @@ def process_pdf_file(pdf_path: str, document_id: str, original_filename: Optiona
         }
 
         detection = detect_bank(extracted["pages"], context["bank_hint"])
+        context["detected_bank"] = detection["detected_bank"]
+        context["resolved_bank"] = detection["resolved_bank"]
         parser_metadata = {
             "detected_bank": detection["detected_bank"],
             "bank_detection_confidence": detection["bank_detection_confidence"],
@@ -89,18 +89,18 @@ def process_pdf_file(pdf_path: str, document_id: str, original_filename: Optiona
                 "error": detection["error"],
             }
 
-        if detection["resolved_bank"] == "Santander":
-            parser = SantanderStatementParser()
-        else:
-            parser = GenericTableParser()
-
+        parser = select_parser(context)
         parser_result = parser.parse(context)
         reconciliation_result = reconcile(parser_result.get("statement", {}), parser_result.get("transactions", []))
         parser_adapter = getattr(parser, "parser_adapter", parser.parser_name)
         parser_metadata["parser_adapter"] = parser_adapter
 
+        status = "success"
+        if reconciliation_result["status"] != "matched":
+            status = reconciliation_result["status"]
+
         return {
-            "status": "success",
+            "status": status,
             "detected_bank": detection["detected_bank"],
             "bank_detection_confidence": detection["bank_detection_confidence"],
             "bank_hint": detection["bank_hint"],

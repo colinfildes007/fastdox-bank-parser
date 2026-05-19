@@ -1,0 +1,37 @@
+{
+  "detected_bank": "Lloyds Bank",
+  "bank_detection_confidence": 0.90,
+  "parser_adapter": "lloyds_family_v1",
+  "page_count": 1,
+  "statement_start_date": "2025-01-01",
+  "statement_end_date": "2025-01-08",
+  "opening_balance": 1000.0,
+  "closing_balance": 1836.8,
+  "total_credits": 1235.8,
+  "total_debits": 399.0,
+  "transaction_count": 8,
+  "reconciliation_status": "matched",
+  "transactions": [
+    {
+      "transaction_date": "2025-01-01",
+      "description_raw": "Salary",
+      "amount": 1200.0,
+      "type": "credit",
+      "balance_after": 2200.0
+    },
+    {
+      "transaction_date": "2025-01-02",
+      "description_raw": "Coffee",
+      "amount": 3.2,
+      "type": "debit",
+      "balance_after": 2196.8
+    },
+    {
+      "transaction_date": "2025-01-08",
+      "description_raw": "Refund",
+      "amount": 25.0,
+      "type": "credit",
+      "balance_after": 1836.8
+    }
+  ]
+}
