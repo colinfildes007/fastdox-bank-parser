@@ -229,6 +229,137 @@ def build_lloyds_flat_table_pdf():
     return doc.write()
 
 
+LLOYDS_REAL_TRANSACTIONS = [
+    # page, date, description, type, money_in, money_out, balance
+    (1, "02 Jan 26", "ROCHDALE MBC", "DD", None, 164.00, 9.00),
+    (1, "02 Jan 26", "AIDAN SHERWOOD", "FPI", 295.00, None, 304.00),
+    (1, "02 Jan 26", "EMELIE BYROM", "FPO", None, 120.00, 184.00),
+    (1, "02 Jan 26", "DWF LAW LLP", "FPO", None, 50.00, 134.00),
+    (1, "02 Jan 26", "LINDSAY LEONG", "FPO", None, 25.00, 109.00),
+    (1, "02 Jan 26", "PAUL SHERWOOD", "FPO", None, 100.00, 9.00),
+    (1, "05 Jan 26", "PAUL MICHAEL SHERW", "FPI", 240.00, None, 249.00),
+    (1, "05 Jan 26", "LNK TESCO OLDH MID", "CPT", None, 240.00, 9.00),
+    (1, "05 Jan 26", "SHERWOOD P M", "FPI", 30.00, None, 39.00),
+    (1, "05 Jan 26", "LNK COOPERATIVE M2", "CPT", None, 30.00, 9.00),
+    (1, "05 Jan 26", "SHERWOOD P M", "FPI", 500.00, None, 509.00),
+    (1, "05 Jan 26", "P.O. G9 MIDDLETON", "CPT", None, 300.00, 209.00),
+    (1, "05 Jan 26", "P.O. G9 MIDDLETON", "CPT", None, 200.00, 9.00),
+    (1, "09 Jan 26", "SHERWOOD P M", "FPI", 50.00, None, 59.00),
+    (1, "09 Jan 26", "DWF LAW LLP", "FPO", None, 50.00, 9.00),
+    (1, "12 Jan 26", "SHERWOOD P M", "FPI", 140.00, None, 149.00),
+    (2, "12 Jan 26", "KALOOKI SPORTSBOOK", "FPO", None, 100.00, 49.00),
+    (2, "12 Jan 26", "PAUL SHERWOOD", "FPO", None, 40.00, 9.00),
+    (2, "12 Jan 26", "HTEC SOLUTIO LTD", "FPI", 3000.00, None, 3009.00),
+    (2, "12 Jan 26", "COLIN FILDES", "FPO", None, 1500.00, 1509.00),
+    (2, "12 Jan 26", "PAUL SHERWOOD", "FPO", None, 1500.00, 9.00),
+    (2, "12 Jan 26", "AIDAN SHERWOOD", "FPI", 50.00, None, 59.00),
+    (2, "12 Jan 26", "PAUL SHERWOOD", "FPO", None, 50.00, 9.00),
+    (2, "16 Jan 26", "AIDAN SHERWOOD", "FPI", 325.00, None, 334.00),
+    (2, "16 Jan 26", "EMELIE BYROM", "FPO", None, 120.00, 214.00),
+    (2, "16 Jan 26", "DWF LAW LLP", "FPO", None, 50.00, 164.00),
+    (2, "16 Jan 26", "LINDSAY LEONG", "FPO", None, 50.00, 114.00),
+    (2, "16 Jan 26", "PAUL SHERWOOD", "FPO", None, 105.00, 9.00),
+    (2, "23 Jan 26", "AIDAN SHERWOOD", "FPI", 300.00, None, 309.00),
+    (2, "23 Jan 26", "DWF LAW LLP", "FPO", None, 50.00, 259.00),
+    (2, "23 Jan 26", "EMELIE BYROM", "FPO", None, 120.00, 139.00),
+    (2, "23 Jan 26", "LINDSAY LEONG", "FPO", None, 25.00, 114.00),
+    (2, "23 Jan 26", "PAUL SHERWOOD", "FPO", None, 105.00, 9.00),
+    (2, "23 Jan 26", "PAUL SHERWOOD", "FPO", None, 9.00, 0.00),
+    (2, "26 Jan 26", "J JOHNSTONE", "SO", 940.00, None, 940.00),
+    (2, "26 Jan 26", "PAUL SHERWOOD", "FPO", None, 700.00, 240.00),
+    (2, "26 Jan 26", "PAUL SHERWOOD", "FPO", None, 20.00, 220.00),
+    (2, "27 Jan 26", "PAUL SHERWOOD", "FPO", None, 10.00, 210.00),
+    (3, "28 Jan 26", "UNITED UTILITIES W", "DD", None, 67.00, 143.00),
+    (3, "28 Jan 26", "SHERWOOD P M", "FPI", 30.00, None, 173.00),
+    (3, "28 Jan 26", "SHERWOOD P M", "FPI", 50.00, None, 223.00),
+    (3, "28 Jan 26", "LNK TESCO OLDH MID", "CPT", None, 50.00, 173.00),
+    (3, "28 Jan 26", "SHERWOOD P M", "FPI", 100.00, None, 273.00),
+    (3, "28 Jan 26", "SHERWOOD P M", "FPI", 60.00, None, 333.00),
+    (3, "29 Jan 26", "SHERWOOD P M", "FPI", 100.00, None, 433.00),
+    (3, "29 Jan 26", "WILLIAMHILL*INTERN", "DEB", None, 50.00, 383.00),
+    (3, "29 Jan 26", "WILLIAMHILL*INTERN", "DEB", None, 50.00, 333.00),
+    (3, "29 Jan 26", "WILLIAMHILL*INTERN", "DEB", None, 60.00, 273.00),
+    (3, "30 Jan 26", "AIDAN SHERWOOD", "FPI", 227.00, None, 500.00),
+    (3, "30 Jan 26", "DWF LAW LLP", "FPO", None, 50.00, 450.00),
+    (3, "30 Jan 26", "EMELIE BYROM", "FPO", None, 120.00, 330.00),
+    (3, "30 Jan 26", "THREE MOBILE", "FPO", None, 32.60, 297.40),
+    (3, "30 Jan 26", "LINDSAY LEONG", "FPO", None, 25.00, 272.40),
+    (3, "30 Jan 26", "AIDAN SHERWOOD", "FPI", 100.00, None, 372.40),
+    (3, "30 Jan 26", "WILLIAMHILL*INTERN", "DEB", None, 100.00, 272.40),
+]
+
+
+def build_lloyds_real_classic_pdf():
+    """Reproduction of a real Lloyds 'Classic' statement: 3 pages, 55
+    transactions in labelled-block layout where every cell value carries a
+    trailing full stop and empty money cells read 'blank.'."""
+    import fitz
+
+    def money_cell(value):
+        return "blank." if value is None else f"{value:,.2f}."
+
+    column_block = [
+        "Your Transactions",
+        "Column", "Date.",
+        "Column", "Description.",
+        "Column", "Type.",
+        "Column", "Money In (£).",
+        "Column", "Money Out (£).",
+        "Column", "Balance (£).",
+    ]
+
+    def tx_block(date, desc, ttype, money_in, money_out, balance):
+        return [
+            "Date", f"{date}.",
+            "Description", f"{desc}.",
+            "Type", f"{ttype}.",
+            "Money In (£)", money_cell(money_in),
+            "Money Out (£)", money_cell(money_out),
+            "Balance (£)", f"{balance:,.2f}.",
+        ]
+
+    pages_lines = {
+        1: [
+            "Page 1 of 3",
+            "Lloyds Bank plc",
+            "Classic statement",
+            "Your Account",
+            "Sort Code 77-19-26",
+            "Account Number 41496768",
+            "Statement period 01 Jan 26 to 31 Jan 26",
+            "Money In £6,537.00",
+            "Money Out £6,437.60",
+            "Balance on 01 January 2026 £173.00",
+            "Balance on 31 January 2026 £272.40",
+        ],
+        2: ["Page 2 of 3", "Lloyds Bank plc", "CLASSIC Sort Code 77-19-26", "Account Number 41496768"],
+        3: ["Page 3 of 3", "Lloyds Bank plc", "CLASSIC Sort Code 77-19-26", "Account Number 41496768"],
+    }
+    for page_number in (1, 2, 3):
+        pages_lines[page_number] += column_block
+    for (page_number, date, desc, ttype, money_in, money_out, balance) in LLOYDS_REAL_TRANSACTIONS:
+        pages_lines[page_number] += tx_block(date, desc, ttype, money_in, money_out, balance)
+    pages_lines[1].append("(Continued on next page)")
+    pages_lines[2].append("(Continued on next page)")
+    pages_lines[3] += [
+        "Transaction types.",
+        "BGC. Bank Giro Credit. BP. Bill Payments. CHG. Charge. CHQ. Cheque.",
+        "DD. Direct Debit. DEB. Debit Card. FPI. Faster Payment In. FPO. Faster Payment Out.",
+        "SO. Standing Order. TFR. Transfer.",
+    ]
+
+    doc = fitz.open()
+    for page_number in (1, 2, 3):
+        lines = pages_lines[page_number]
+        # Tall page so every line fits and is recovered by the text layer.
+        page = doc.new_page(width=612, height=80 + len(lines) * 11 + 60)
+        y = 50
+        for line in lines:
+            page.insert_text((40, y), line, fontsize=8)
+            y += 11
+    return doc.write()
+
+
 class LloydsFamilyFixtureTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
@@ -496,6 +627,65 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
         self.assertEqual(second["transaction_type"], "DD")
         self.assertEqual(second["paid_out"], 1200.0)
         self.assertEqual(second["type"], "debit")
+
+    def test_lloyds_real_classic_statement_reconciles(self):
+        pdf_bytes = build_lloyds_real_classic_pdf()
+        response = self._post_pdf(pdf_bytes)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+
+        self.assertEqual(body["status"], "success")
+        self.assertEqual(body["detected_bank"], "Lloyds Bank")
+        self.assertEqual(body["parser_adapter"], "lloyds_family_v1")
+        self.assertEqual(body["page_count"], 3)
+        # The real statement has 55 transaction rows (not 48).
+        self.assertEqual(body["transaction_count"], 55)
+
+        self.assertEqual(body["statement"]["opening_balance"], 173.0)
+        self.assertEqual(body["statement"]["closing_balance"], 272.4)
+        self.assertEqual(body["statement"]["total_credits"], 6537.0)
+        self.assertEqual(body["statement"]["total_debits"], 6437.6)
+
+        recon = body["reconciliation"]
+        self.assertEqual(recon["status"], "matched")
+        self.assertEqual(recon["calculated_total_credits"], 6537.0)
+        self.assertEqual(recon["calculated_total_debits"], 6437.6)
+
+        debug = body["parser_debug"]
+        self.assertTrue(debug["transaction_parser_called"])
+        self.assertTrue(debug["header_parsed"])
+        self.assertEqual(debug["transactions_returned"], 55)
+        self.assertEqual(debug["per_page_transaction_counts"], {"1": 16, "2": 22, "3": 17})
+        self.assertEqual(debug["date_matches_found"], 55)
+        self.assertEqual(debug["type_matches_found"], 55)
+
+        by_desc = {}
+        for tx in body["transactions"]:
+            by_desc.setdefault(tx["description_raw"], []).append(tx)
+
+        rochdale = by_desc["ROCHDALE MBC"][0]
+        self.assertEqual(rochdale["transaction_date"], "2026-01-02")
+        self.assertEqual(rochdale["transaction_type"], "DD")
+        self.assertEqual(rochdale["paid_in"], 0.0)
+        self.assertEqual(rochdale["paid_out"], 164.0)
+        self.assertEqual(rochdale["balance_after"], 9.0)
+        self.assertEqual(rochdale["type"], "debit")
+
+        htec = by_desc["HTEC SOLUTIO LTD"][0]
+        self.assertEqual(htec["transaction_type"], "FPI")
+        self.assertEqual(htec["paid_in"], 3000.0)
+        self.assertEqual(htec["paid_out"], 0.0)
+        self.assertEqual(htec["balance_after"], 3009.0)
+        self.assertEqual(htec["type"], "credit")
+
+        three = by_desc["THREE MOBILE"][0]
+        self.assertEqual(three["paid_out"], 32.6)
+        self.assertEqual(three["transaction_type"], "FPO")
+
+        # trailing full stop dropped, internal dots preserved
+        self.assertIn("P.O. G9 MIDDLETON", by_desc)
+        # a zero-balance row is still captured
+        self.assertTrue(any(tx["balance_after"] == 0.0 for tx in body["transactions"]))
 
     def test_health_includes_available_adapters(self):
         response = self.client.get("/health")

@@ -471,7 +471,7 @@ class LloydsStatementParser(BaseStatementParser):
         def note_type(token: Optional[str]) -> None:
             if debug is None or not token:
                 return
-            if token.strip().upper() in TRANSACTION_TYPE_CODES:
+            if token.strip().rstrip(".").upper() in TRANSACTION_TYPE_CODES:
                 debug["type_matches_found"] = debug.get("type_matches_found", 0) + 1
 
         def emit(transaction: Optional[Dict]) -> None:
@@ -690,9 +690,13 @@ class LloydsStatementParser(BaseStatementParser):
         if value is None:
             return ""
         text = re.sub(r"\s{2,}", " ", str(value).strip())
-        # Requirement 6: an empty cell is rendered as the literal token "blank.".
+        # An empty cell is rendered as the literal token "blank" / "blank.".
         if text.lower().rstrip(".") == "blank":
             return ""
+        # Lloyds renders each cell value with a trailing full stop; drop it
+        # while preserving internal dots (e.g. "P.O. G9 MIDDLETON").
+        if text.endswith("."):
+            text = text[:-1].rstrip()
         return text
 
     def _build_transaction(
