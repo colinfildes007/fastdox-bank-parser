@@ -69,6 +69,10 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
         self.expected = json.loads(
             Path("tests/fixtures/lloyds_family/expected_output.json").read_text()
         )
+        self.halifax_fixture_path = Path("tests/fixtures/lloyds_family/sample_statement_halifax.pdf")
+        self.expected_halifax = json.loads(
+            Path("tests/fixtures/lloyds_family/expected_output_halifax.json").read_text()
+        )
 
     def _post_pdf(self, pdf_bytes):
         files = {
@@ -87,6 +91,17 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
         self.assertEqual(body["parser_adapter"], self.expected["parser_adapter"])
         self.assertEqual(body["page_count"], self.expected["page_count"])
 
+    def test_halifax_family_bank_detection(self):
+        pdf_bytes = self.halifax_fixture_path.read_bytes()
+        response = self._post_pdf(pdf_bytes)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+
+        self.assertEqual(body["detected_bank"], "Halifax")
+        self.assertGreaterEqual(body["bank_detection_confidence"], self.expected_halifax["minimum_detection_confidence"])
+        self.assertEqual(body["parser_adapter"], self.expected_halifax["parser_adapter"])
+        self.assertEqual(body["page_count"], self.expected_halifax["page_count"])
+
     def test_lloyds_family_extraction_reconciles(self):
         pdf_bytes = self.fixture_path.read_bytes()
         response = self._post_pdf(pdf_bytes)
@@ -102,6 +117,33 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
         self.assertEqual(body["reconciliation"]["status"], self.expected["reconciliation_status"])
 
         for expected_tx in self.expected["transactions"]:
+            self.assertTrue(
+                any(
+                    tx["transaction_date"] == expected_tx["transaction_date"]
+                    and tx["description_raw"] == expected_tx["description_raw"]
+                    and abs(abs(tx["amount"]) - expected_tx["amount"]) < 0.01
+                    and tx["type"] == expected_tx["type"]
+                    and abs(tx["balance_after"] - expected_tx["balance_after"]) < 0.01
+                    for tx in body["transactions"]
+                ),
+                f"Expected transaction not found: {expected_tx}",
+            )
+
+    def test_halifax_family_extraction_reconciles(self):
+        pdf_bytes = self.halifax_fixture_path.read_bytes()
+        response = self._post_pdf(pdf_bytes)
+        body = response.json()
+
+        self.assertEqual(body["transaction_count"], self.expected_halifax["transaction_count"])
+        self.assertEqual(body["statement"]["opening_balance"], self.expected_halifax["opening_balance"])
+        self.assertEqual(body["statement"]["closing_balance"], self.expected_halifax["closing_balance"])
+        self.assertEqual(body["statement"]["total_credits"], self.expected_halifax["total_credits"])
+        self.assertEqual(body["statement"]["total_debits"], self.expected_halifax["total_debits"])
+        self.assertEqual(body["statement"]["statement_start_date"], self.expected_halifax["statement_start_date"])
+        self.assertEqual(body["statement"]["statement_end_date"], self.expected_halifax["statement_end_date"])
+        self.assertEqual(body["reconciliation"]["status"], self.expected_halifax["reconciliation_status"])
+
+        for expected_tx in self.expected_halifax["transactions"]:
             self.assertTrue(
                 any(
                     tx["transaction_date"] == expected_tx["transaction_date"]

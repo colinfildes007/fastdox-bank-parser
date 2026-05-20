@@ -1,0 +1,51 @@
+{
+  "detected_bank": "Halifax",
+  "minimum_detection_confidence": 0.90,
+  "parser_adapter": "lloyds_family_v1",
+  "page_count": 1,
+  "statement_start_date": "2025-02-10",
+  "statement_end_date": "2025-02-17",
+  "opening_balance": 1000.0,
+  "closing_balance": 2407.2,
+  "total_credits": 1657.0,
+  "total_debits": 249.8,
+  "transaction_count": 8,
+  "reconciliation_status": "matched",
+  "transactions": [
+    {
+      "transaction_date": "2025-02-10",
+      "description_raw": "Salary",
+      "amount": 1400.0,
+      "type": "credit",
+      "balance_after": 2400.0
+    },
+    {
+      "transaction_date": "2025-02-11",
+      "description_raw": "Coffee",
+      "amount": 4.5,
+      "type": "debit",
+      "balance_after": 2395.5
+    },
+    {
+      "transaction_date": "2025-02-12",
+      "description_raw": "Groceries",
+      "amount": 55.3,
+      "type": "debit",
+      "balance_after": 2340.2
+    },
+    {
+      "transaction_date": "2025-02-13",
+      "description_raw": "Refund",
+      "amount": 35.0,
+      "type": "credit",
+      "balance_after": 2375.2
+    },
+    {
+      "transaction_date": "2025-02-14",
+      "description_raw": "Bill payment",
+      "amount": 120.0,
+      "type": "debit",
+      "balance_after": 2255.2
+    }
+  ]
+}
