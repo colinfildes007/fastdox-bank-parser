@@ -93,9 +93,9 @@ TRANSACTION_STREAM_RE = re.compile(
     r"Date\s+(?P<date>\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4})\.?\s+"
     r"Description\s+(?P<desc>.+?)\.?\s+"
     r"Type\s+(?P<type>[A-Za-z]{2,5})\.?"
-    r"\s+Money\s*In\s*(?:\(\s*£?\s*\))?\.?(?:\s+(?P<mi>blank\.?|£?[\d,]+\.\d{2}))?"
-    r"\s+Money\s*Out\s*(?:\(\s*£?\s*\))?\.?(?:\s+(?P<mo>blank\.?|£?[\d,]+\.\d{2}))?"
-    r"\s+Balance\s*(?:\(\s*£?\s*\))?\.?\s+(?P<bal>-?£?[\d,]+\.\d{2})",
+    r"\s+Money\s*In\s*(?:\(\s*£?\s*\))?\.?(?:\s+(?P<mi>blank\.?|£?[\d,]+\.\d{2})\.?)?"
+    r"\s+Money\s*Out\s*(?:\(\s*£?\s*\))?\.?(?:\s+(?P<mo>blank\.?|£?[\d,]+\.\d{2})\.?)?"
+    r"\s+Balance\s*(?:\(\s*£?\s*\))?\.?\s+(?P<bal>-?£?[\d,]+\.\d{2})\.?",
     re.IGNORECASE,
 )
 
@@ -231,6 +231,8 @@ class LloydsStatementParser(BaseStatementParser):
                     "first_5_candidate_blocks": transaction_debug.get("first_5_candidate_blocks", []),
                     "transaction_section_sample": transaction_debug.get("transaction_section_sample", []),
                     "flow_text_sample": transaction_debug.get("flow_text_sample", []),
+                    "duplicate_transaction_count": transaction_debug.get("duplicate_transaction_count", 0),
+                    "duplicate_candidates": transaction_debug.get("duplicate_candidates", []),
                     "first_transaction": first_transaction,
                     "last_transaction": last_transaction,
                     "transaction_rows": sum(page_stat.get("transaction_rows", 0) for page_stat in page_stats),
@@ -404,8 +406,6 @@ class LloydsStatementParser(BaseStatementParser):
         for page in pages:
             page_text = page.get("text", "") or ""
             page_number = page.get("page_number")
-            page_credit = 0.0
-            page_debit = 0.0
             page_transactions: List[Dict] = []
 
             # Strategy 1: geometry-based table extraction.
@@ -464,24 +464,98 @@ class LloydsStatementParser(BaseStatementParser):
                         else:
                             issues.append("transaction_parse_failed")
 
-            for transaction in page_transactions:
-                parsed.append(transaction)
-                page_credit += float(transaction.get("paid_in", 0.0))
-                page_debit += float(transaction.get("paid_out", 0.0))
+            parsed.extend(page_transactions)
 
+        parsed = self._assign_directions(parsed, issues)
+        # Remove true duplicates (page-boundary overlap / double-read) before
+        # returning; this also records duplicate diagnostics on `debug`.
+        parsed = self._deduplicate_transactions(parsed, debug)
+
+        # Page statistics are derived from the final (deduplicated) rows.
+        page_stats = []
+        for page in pages:
+            page_number = page.get("page_number")
+            page_rows = [tx for tx in parsed if tx.get("page_number") == page_number]
             page_stats.append(
                 {
                     "page_number": page_number,
-                    "transaction_blocks": len(page_transactions),
-                    "transaction_rows": len(page_transactions),
-                    "total_credit": round(page_credit, 2),
-                    "total_debit": round(page_debit, 2),
-                    "text_length": len(page_text),
+                    "transaction_blocks": len(page_rows),
+                    "transaction_rows": len(page_rows),
+                    "total_credit": round(sum(float(tx.get("paid_in", 0.0)) for tx in page_rows), 2),
+                    "total_debit": round(sum(float(tx.get("paid_out", 0.0)) for tx in page_rows), 2),
+                    "text_length": len(page.get("text", "") or ""),
                 }
             )
 
-        parsed = self._assign_directions(parsed, issues)
         return parsed, page_stats, issues, debug
+
+    def _deduplicate_transactions(self, transactions: List[Dict], debug: Dict) -> List[Dict]:
+        """Drop true duplicate rows and record duplicate diagnostics.
+
+        A *true duplicate* matches on the full identity key — date,
+        description, type, paid in, paid out **and balance after**. Because the
+        running balance changes after every transaction, two rows with an
+        identical balance are a parser double-read, not two real payments.
+
+        Rows that share everything *except* balance_after (e.g. two genuine
+        same-day same-amount payments) are kept and only surfaced as
+        ``duplicate_candidates`` for inspection.
+        """
+
+        def identity(transaction: Dict) -> tuple:
+            return (
+                transaction.get("transaction_date"),
+                (transaction.get("description_raw") or "").strip().upper(),
+                (transaction.get("transaction_type") or "").strip().upper(),
+                round(float(transaction.get("paid_in", 0.0) or 0.0), 2),
+                round(float(transaction.get("paid_out", 0.0) or 0.0), 2),
+                round(float(transaction.get("balance_after", 0.0) or 0.0), 2),
+            )
+
+        deduped: List[Dict] = []
+        seen = set()
+        removed = 0
+        for transaction in transactions:
+            key = identity(transaction)
+            if key in seen:
+                removed += 1
+                continue
+            seen.add(key)
+            deduped.append(transaction)
+
+        # Weak-key groups (identity without balance_after) — same date /
+        # description / type / amount but a different running balance.
+        weak_groups: Dict[tuple, List[Dict]] = {}
+        for transaction in deduped:
+            weak_groups.setdefault(identity(transaction)[:5], []).append(transaction)
+
+        duplicate_candidates = []
+        for weak_key, rows in weak_groups.items():
+            if len(rows) > 1:
+                duplicate_candidates.append(
+                    {
+                        "key": " | ".join(str(part) for part in weak_key),
+                        "rows": [self._duplicate_row_summary(row) for row in rows],
+                    }
+                )
+
+        debug["duplicate_transaction_count"] = removed
+        debug["duplicate_candidates"] = duplicate_candidates
+        return deduped
+
+    def _duplicate_row_summary(self, transaction: Dict) -> Dict:
+        return {
+            "date": transaction.get("transaction_date"),
+            "description_raw": transaction.get("description_raw"),
+            "transaction_type": transaction.get("transaction_type"),
+            "paid_in": transaction.get("paid_in"),
+            "paid_out": transaction.get("paid_out"),
+            "balance_after": transaction.get("balance_after"),
+            "page_number": transaction.get("page_number"),
+            "row_index": transaction.get("row_index"),
+            "source_line_start": transaction.get("source_line_start"),
+            "source_line_end": transaction.get("source_line_end"),
+        }
 
     def _parse_table_rows(
         self,
@@ -597,15 +671,30 @@ class LloydsStatementParser(BaseStatementParser):
         each field on its own line, merges labels and values onto one line, or
         appends a trailing full stop to every cell.
         """
-        section = page_text
-        start = section.lower().find("your transactions")
+        section_offset = 0
+        start = page_text.lower().find("your transactions")
         if start != -1:
-            section = section[start + len("your transactions"):]
+            section_offset = start + len("your transactions")
+        section = page_text[section_offset:]
         stop = section.lower().find("transaction types")
         if stop != -1:
             section = section[:stop]
 
-        blob = " ".join(section.split())
+        # Collapse the section to a single-spaced blob, recording for each blob
+        # token the offset it came from in page_text — so a regex match can be
+        # mapped back to a source line range.
+        blob_parts: List[str] = []
+        token_spans: List[Tuple[int, int, int]] = []  # blob_start, blob_end, page_offset
+        cursor = 0
+        for token in re.finditer(r"\S+", section):
+            if blob_parts:
+                blob_parts.append(" ")
+                cursor += 1
+            word = token.group(0)
+            token_spans.append((cursor, cursor + len(word), section_offset + token.start()))
+            blob_parts.append(word)
+            cursor += len(word)
+        blob = "".join(blob_parts)
         if not blob:
             return []
 
@@ -622,6 +711,12 @@ class LloydsStatementParser(BaseStatementParser):
             block["paid_in"] = self._parse_money(match.group("mi"))
             block["paid_out"] = self._parse_money(match.group("mo"))
             block["balance_after"] = self._parse_money_or_none(match.group("bal"))
+            block["source_line_start"] = self._blob_offset_to_line(
+                match.start(), token_spans, page_text
+            )
+            block["source_line_end"] = self._blob_offset_to_line(
+                max(match.end() - 1, match.start()), token_spans, page_text
+            )
 
             transaction = self._build_transaction(block, page_number)
             if transaction is None:
@@ -642,6 +737,26 @@ class LloydsStatementParser(BaseStatementParser):
                     first_blocks.append(match.group(0)[:160])
 
         return transactions
+
+    def _blob_offset_to_line(
+        self,
+        blob_offset: int,
+        token_spans: List[Tuple[int, int, int]],
+        page_text: str,
+    ) -> Optional[int]:
+        """Map a position in the collapsed blob back to a 1-based line number
+        in the original page text."""
+        page_offset = None
+        for blob_start, blob_end, source_offset in token_spans:
+            if blob_start <= blob_offset < blob_end:
+                page_offset = source_offset
+                break
+            if blob_start > blob_offset:
+                page_offset = source_offset
+                break
+        if page_offset is None:
+            return None
+        return page_text.count("\n", 0, page_offset) + 1
 
     def _parse_labeled_transactions(
         self,
@@ -899,6 +1014,8 @@ class LloydsStatementParser(BaseStatementParser):
             "paid_in": 0.0,
             "paid_out": 0.0,
             "balance_after": None,
+            "source_line_start": None,
+            "source_line_end": None,
         }
 
     def _match_field_label(self, line: str) -> Tuple[Optional[str], Optional[str]]:
@@ -975,6 +1092,9 @@ class LloydsStatementParser(BaseStatementParser):
             "type": direction,
             "page_number": page_number or 0,
             "row_index": 0,
+            "source_line_start": block.get("source_line_start"),
+            "source_line_end": block.get("source_line_end"),
+            "parser_adapter": self.parser_adapter,
             "confidence": 0.95,
         }
 

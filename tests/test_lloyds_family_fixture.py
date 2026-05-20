@@ -493,6 +493,51 @@ def build_lloyds_ruled_table_pdf():
     return doc.write()
 
 
+def build_lloyds_double_read_pdf():
+    """A statement where one transaction block is emitted twice (a parser
+    double-read): the copy is identical on every field including balance_after
+    and must be removed. A separate pair shares date / description / type /
+    amount but has a different running balance — a legitimate repeat that must
+    be kept and only surfaced as a duplicate candidate."""
+    import fitz
+
+    def block(date, desc, ttype, money_in, money_out, balance):
+        return [
+            "Date", date,
+            "Description", desc,
+            "Type", ttype,
+            "Money In (£)", ("blank." if money_in is None else f"{money_in:,.2f}"),
+            "Money Out (£)", ("blank." if money_out is None else f"{money_out:,.2f}"),
+            "Balance (£)", f"{balance:,.2f}",
+        ]
+
+    salary = block("02 Jan 26", "SALARY", "FPI", 1000.00, None, 1173.00)
+    lines = [
+        "Lloyds Bank plc",
+        "Classic statement",
+        "Statement period 01 Jan 26 to 31 Jan 26",
+        "Money In £1,200.00",
+        "Money Out £1,000.00",
+        "Balance on 01 January 2026 £173.00",
+        "Balance on 31 January 2026 £373.00",
+        "Your Transactions",
+    ]
+    lines += salary  # transaction 1
+    lines += salary  # transaction 1 again — a true double-read
+    lines += block("03 Jan 26", "RENT PAYMENT", "DD", None, 500.00, 673.00)
+    lines += block("03 Jan 26", "RENT PAYMENT", "DD", None, 500.00, 173.00)
+    lines += block("04 Jan 26", "REFUND", "FPI", 200.00, None, 373.00)
+    lines += ["Transaction types"]
+
+    doc = fitz.open()
+    page = doc.new_page(width=520, height=80 + len(lines) * 12 + 60)
+    y = 50
+    for line in lines:
+        page.insert_text((40, y), line, fontsize=8)
+        y += 12
+    return doc.write()
+
+
 class LloydsFamilyFixtureTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
@@ -792,6 +837,15 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
         self.assertEqual(debug["date_matches_found"], 55)
         self.assertEqual(debug["type_matches_found"], 55)
 
+        # The two 29 Jan WILLIAMHILL*INTERN £50.00 rows share date / description
+        # / type / amount but differ in balance_after -> a legitimate repeat,
+        # not a true duplicate: kept, and only surfaced as a candidate.
+        self.assertEqual(debug["duplicate_transaction_count"], 0)
+        candidate_keys = [c["key"] for c in debug["duplicate_candidates"]]
+        self.assertIn("2026-01-29 | WILLIAMHILL*INTERN | DEB | 0.0 | 50.0", candidate_keys)
+        for tx in body["transactions"]:
+            self.assertEqual(tx["parser_adapter"], "lloyds_family_v1")
+
         by_desc = {}
         for tx in body["transactions"]:
             by_desc.setdefault(tx["description_raw"], []).append(tx)
@@ -913,6 +967,46 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
         htec = by_desc["HTEC SOLUTIO LTD"][0]
         self.assertEqual(htec["paid_in"], 3000.0)
         self.assertEqual(htec["transaction_type"], "FPI")
+
+    def test_lloyds_double_read_is_deduplicated(self):
+        pdf_bytes = build_lloyds_double_read_pdf()
+        response = self._post_pdf(pdf_bytes)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+
+        self.assertEqual(body["status"], "success")
+        # Five rows parsed; the duplicated SALARY block is removed -> four.
+        self.assertEqual(body["transaction_count"], 4)
+        self.assertEqual(body["reconciliation"]["status"], "matched")
+        self.assertEqual(body["reconciliation"]["calculated_total_credits"], 1200.0)
+        self.assertEqual(body["reconciliation"]["calculated_total_debits"], 1000.0)
+
+        debug = body["parser_debug"]
+        self.assertEqual(debug["duplicate_transaction_count"], 1)
+
+        # The kept RENT PAYMENT pair (same amount, different balance) is the
+        # only remaining duplicate candidate.
+        self.assertEqual(len(debug["duplicate_candidates"]), 1)
+        candidate = debug["duplicate_candidates"][0]
+        self.assertEqual(len(candidate["rows"]), 2)
+        self.assertEqual(
+            sorted(row["balance_after"] for row in candidate["rows"]),
+            [173.0, 673.0],
+        )
+
+        # No surviving row is an exact duplicate of another.
+        identities = [
+            (
+                tx["transaction_date"],
+                tx["description_raw"],
+                tx["transaction_type"],
+                tx["paid_in"],
+                tx["paid_out"],
+                tx["balance_after"],
+            )
+            for tx in body["transactions"]
+        ]
+        self.assertEqual(len(identities), len(set(identities)))
 
     def test_health_includes_available_adapters(self):
         response = self.client.get("/health")
