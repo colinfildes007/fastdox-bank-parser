@@ -10,6 +10,16 @@ DATE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 MONEY_PATTERN = re.compile(r"£?[\d,]+\.\d{2}")
+MONEY_IN_PATTERN = re.compile(r"money\s+in\s*[:\-]?\s*£?([\d,]+\.\d{2})", re.IGNORECASE)
+MONEY_OUT_PATTERN = re.compile(r"money\s+out\s*[:\-]?\s*£?([\d,]+\.\d{2})", re.IGNORECASE)
+OPENING_BALANCE_PATTERN = re.compile(
+    r"(?:opening\s*/\s*previous\s+balance|opening\s+balance|previous\s+balance)\s*[:\-]?\s*£?([\d,]+\.\d{2})",
+    re.IGNORECASE,
+)
+BALANCE_ON_PATTERN = re.compile(
+    r"balance\s+on\s+(\d{1,2}(?:/\d{1,2}(?:/\d{2,4})?|\s+\w+\s+\d{2,4}))\s*[:\-]?\s*£?([\d,]+\.\d{2})",
+    re.IGNORECASE,
+)
 FOOTER_PATTERNS = [
     "total debits",
     "total debit",
@@ -22,6 +32,16 @@ FOOTER_PATTERNS = [
     "account name",
     "account holder",
     "statement period",
+]
+SUMMARY_KEYWORDS = [
+    "money in",
+    "money out",
+    "balance on",
+    "opening balance",
+    "previous balance",
+    "statement period",
+    "classic",
+    "club lloyds",
 ]
 MONTH_MAP = {
     "jan": "01",
@@ -41,7 +61,7 @@ TOLERANCE = 0.01
 
 
 class LloydsStatementParser(BaseStatementParser):
-    bank_name = "Lloyds Bank"
+    bank_name = "Lloyds"
     parser_name = "lloyds_family_text_v1"
     parser_adapter = "lloyds_family_v1"
 
@@ -50,25 +70,39 @@ class LloydsStatementParser(BaseStatementParser):
         detected_bank = (context.get("detected_bank") or "").lower()
         all_text = (context.get("all_text") or "").lower()
 
-        if any(value in bank_hint for value in ["lloyds", "halifax", "bank of scotland", "bos"]):
+        supported_tokens = [
+            "lloyds bank",
+            "lloyds",
+            "classic",
+            "club lloyds",
+            "money in",
+            "money out",
+            "balance on",
+            "halifax",
+            "bank of scotland",
+            "bos",
+        ]
+
+        if any(value in bank_hint for value in supported_tokens):
             return True
 
-        if any(value in detected_bank for value in ["lloyds", "halifax", "bank of scotland", "bos"]):
+        if any(value in detected_bank for value in supported_tokens):
             return True
 
-        return any(value in all_text for value in ["lloyds bank", "halifax", "bank of scotland", "bos"])
+        return any(value in all_text for value in supported_tokens)
 
     def parse(self, context: Dict) -> Dict:
         pages = context.get("pages", [])
         all_text = context.get("all_text", "")
         page_count = context.get("page_count", 0)
-        detected_bank = context.get("detected_bank") or self.bank_name
 
         statement_info = self._extract_statement_info(all_text)
-        statement_start_date = statement_info["statement_start_date"]
-        statement_end_date = statement_info["statement_end_date"]
+        summary = self._extract_summary(all_text)
 
-        transactions, issues = self._parse_transactions(
+        statement_start_date = statement_info["statement_start_date"] or summary.get("statement_start_date")
+        statement_end_date = statement_info["statement_end_date"] or summary.get("statement_end_date")
+
+        transactions, page_stats, issues = self._parse_transactions(
             pages,
             statement_start_date=statement_start_date,
             statement_end_date=statement_end_date,
@@ -81,22 +115,31 @@ class LloydsStatementParser(BaseStatementParser):
                 statement_end_date = statement_end_date or max(dates)
 
         totals = extract_statement_totals(all_text)
-        opening_balance = totals.get("derived_opening_balance")
+        statement_total_credits = summary.get("money_in") or totals.get("total_credits")
+        statement_total_debits = summary.get("money_out") or totals.get("total_debits")
+        closing_balance = summary.get("closing_balance") or totals.get("closing_balance")
+        opening_balance = summary.get("opening_balance")
+        derived_opening_balance = None
+
         if opening_balance is None:
-            opening_balance = self._estimate_opening_balance(transactions)
+            opening_balance = totals.get("derived_opening_balance") or self._estimate_opening_balance(transactions)
+
+        if opening_balance is None and statement_total_credits is not None and statement_total_debits is not None and closing_balance is not None:
+            derived_opening_balance = round(closing_balance - statement_total_credits + statement_total_debits, 2)
+            opening_balance = derived_opening_balance
 
         statement = {
-            "bank_name": detected_bank,
+            "bank_name": self.bank_name,
             "account_holder": statement_info["account_holder"],
             "account_number": statement_info["account_number"],
             "sort_code": statement_info["sort_code"],
             "statement_start_date": statement_start_date,
             "statement_end_date": statement_end_date,
             "opening_balance": opening_balance,
-            "closing_balance": totals.get("closing_balance"),
-            "total_credits": totals.get("total_credits"),
-            "total_debits": totals.get("total_debits"),
-            "derived_opening_balance": totals.get("derived_opening_balance"),
+            "closing_balance": closing_balance,
+            "total_credits": statement_total_credits,
+            "total_debits": statement_total_debits,
+            "derived_opening_balance": derived_opening_balance,
             "currency": "GBP",
         }
         reconciliation_result = reconcile(statement, transactions)
@@ -104,7 +147,7 @@ class LloydsStatementParser(BaseStatementParser):
         response = self.build_response(context)
         response.update(
             {
-                "bank_name": detected_bank,
+                "bank_name": self.bank_name,
                 "statement": statement,
                 "accounts": [],
                 "transactions": transactions,
@@ -112,16 +155,17 @@ class LloydsStatementParser(BaseStatementParser):
                 "reconciliation": reconciliation_result,
                 "parser_debug": {
                     "parser_name": self.parser_name,
+                    "adapter_selected": self.parser_adapter,
                     "page_count": page_count,
                     "text_layer_detected": context.get("text_layer_detected", False),
                     "ocr_used": False,
-                    "pages": [
-                        {
-                            "page_number": page.get("page_number"),
-                            "text_length": len(page.get("text", "")),
-                        }
-                        for page in pages
-                    ],
+                    "summary_block_found": summary.get("summary_block_found", False),
+                    "money_in_found": summary.get("money_in") is not None,
+                    "money_out_found": summary.get("money_out") is not None,
+                    "opening_balance_found": summary.get("opening_balance") is not None,
+                    "closing_balance_found": summary.get("closing_balance") is not None,
+                    "transaction_rows_detected": sum(page_stat.get("transaction_rows", 0) for page_stat in page_stats),
+                    "pages": page_stats,
                 },
             }
         )
@@ -177,30 +221,91 @@ class LloydsStatementParser(BaseStatementParser):
             return start_date, end_date
         return None, None
 
+    def _extract_summary(self, text: str) -> Dict[str, Optional[float]]:
+        summary = {
+            "summary_block_found": False,
+            "money_in": None,
+            "money_out": None,
+            "opening_balance": None,
+            "closing_balance": None,
+            "statement_start_date": None,
+            "statement_end_date": None,
+        }
+
+        money_in_match = MONEY_IN_PATTERN.search(text)
+        if money_in_match:
+            summary["money_in"] = self._parse_money(money_in_match.group(1))
+            summary["summary_block_found"] = True
+
+        money_out_match = MONEY_OUT_PATTERN.search(text)
+        if money_out_match:
+            summary["money_out"] = self._parse_money(money_out_match.group(1))
+            summary["summary_block_found"] = True
+
+        opening_match = OPENING_BALANCE_PATTERN.search(text)
+        if opening_match:
+            summary["opening_balance"] = self._parse_money(opening_match.group(1))
+            summary["summary_block_found"] = True
+
+        balance_on_match = BALANCE_ON_PATTERN.search(text)
+        if balance_on_match:
+            summary["statement_end_date"] = self._parse_date(balance_on_match.group(1))
+            summary["closing_balance"] = self._parse_money(balance_on_match.group(2))
+            summary["summary_block_found"] = True
+
+        statement_start_date, statement_end_date = self._extract_statement_period(text)
+        summary["statement_start_date"] = summary["statement_start_date"] or statement_start_date
+        summary["statement_end_date"] = summary["statement_end_date"] or statement_end_date
+
+        return summary
+
     def _parse_transactions(
         self,
         pages: List[Dict],
         statement_start_date: Optional[str],
         statement_end_date: Optional[str],
-    ) -> (List[Dict], List[str]):
-        blocks = self._build_transaction_blocks(pages)
+    ) -> Tuple[List[Dict], List[Dict], List[str]]:
         parsed = []
         issues = []
+        page_stats: List[Dict] = []
 
-        for page_number, block in blocks:
-            transaction = self._parse_transaction_block(
-                block,
-                page_number,
-                statement_start_date,
-                statement_end_date,
+        for page in pages:
+            page_text = page.get("text", "")
+            page_order = self._detect_amount_column_order(page_text)
+            blocks = self._build_transaction_blocks([page])
+            page_credit = 0.0
+            page_debit = 0.0
+            page_rows = 0
+
+            for page_number, block in blocks:
+                transaction = self._parse_transaction_block(
+                    block,
+                    page_number,
+                    statement_start_date,
+                    statement_end_date,
+                    amount_order=page_order,
+                )
+                if transaction:
+                    parsed.append(transaction)
+                    page_credit += float(transaction.get("credit", 0.0))
+                    page_debit += float(transaction.get("debit", 0.0))
+                    page_rows += 1
+                else:
+                    issues.append("transaction_parse_failed")
+
+            page_stats.append(
+                {
+                    "page_number": page.get("page_number"),
+                    "transaction_blocks": len(blocks),
+                    "transaction_rows": page_rows,
+                    "total_credit": round(page_credit, 2),
+                    "total_debit": round(page_debit, 2),
+                    "text_length": len(page_text),
+                }
             )
-            if transaction:
-                parsed.append(transaction)
-            else:
-                issues.append("transaction_parse_failed")
 
         parsed = self._assign_directions(parsed, issues)
-        return parsed, issues
+        return parsed, page_stats, issues
 
     def _build_transaction_blocks(self, pages: List[Dict]) -> List[tuple]:
         blocks = []
@@ -214,7 +319,7 @@ class LloydsStatementParser(BaseStatementParser):
                 if not normalized:
                     continue
 
-                if self._is_footer_line(normalized):
+                if self._is_footer_line(normalized) or self._is_summary_line(normalized):
                     if current_block:
                         blocks.append((current_page, current_block))
                         current_block = []
@@ -242,12 +347,27 @@ class LloydsStatementParser(BaseStatementParser):
         lower_line = line.lower()
         return any(token in lower_line for token in FOOTER_PATTERNS)
 
+    def _is_summary_line(self, line: str) -> bool:
+        lower_line = line.lower()
+        return any(token in lower_line for token in SUMMARY_KEYWORDS)
+
+    def _detect_amount_column_order(self, page_text: str) -> str:
+        lower_text = page_text.lower()
+        if "money in" in lower_text and "money out" in lower_text:
+            return "credit_debit"
+        if re.search(r"debit\w*.*credit\w*", lower_text):
+            return "debit_credit"
+        if re.search(r"credit\w*.*debit\w*", lower_text):
+            return "credit_debit"
+        return "debit_credit"
+
     def _parse_transaction_block(
         self,
         block: List[str],
         page_number: Optional[int],
         statement_start_date: Optional[str],
         statement_end_date: Optional[str],
+        amount_order: str = "debit_credit",
     ) -> Optional[Dict]:
         first_line = block[0]
         data_match = DATE_PATTERN.search(first_line)
@@ -268,11 +388,21 @@ class LloydsStatementParser(BaseStatementParser):
         amount = 0.0
 
         if len(money_values) >= 3:
-            debit_amount = money_values[-3]
-            credit_amount = money_values[-2]
-            amount = debit_amount if debit_amount > 0 else credit_amount
-        elif len(money_values) >= 2:
-            amount = money_values[-2]
+            if amount_order == "credit_debit":
+                credit_amount = money_values[-3]
+                debit_amount = money_values[-2]
+            else:
+                debit_amount = money_values[-3]
+                credit_amount = money_values[-2]
+            amount = credit_amount if credit_amount > 0 else debit_amount
+        elif len(money_values) == 2:
+            amount = money_values[0]
+            if amount_order == "credit_debit":
+                credit_amount = money_values[0]
+            else:
+                debit_amount = money_values[0]
+        elif len(money_values) == 1:
+            amount = money_values[0]
 
         description = self._extract_description(block, data_match.group(1))
 

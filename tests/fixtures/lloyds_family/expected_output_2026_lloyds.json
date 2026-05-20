@@ -1,0 +1,8 @@
+{
+  "parser_adapter": "lloyds_family_v1",
+  "opening_balance": 173.0,
+  "closing_balance": 272.4,
+  "total_credits": 6537.0,
+  "total_debits": 6437.6,
+  "reconciliation_status": "matched"
+}

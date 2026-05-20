@@ -10,6 +10,11 @@ VALID_BANK_HINTS = {
     "santander",
     "lloyds",
     "lloyds bank",
+    "classic",
+    "club lloyds",
+    "money in",
+    "money out",
+    "balance on",
     "halifax",
     "bank of scotland",
     "bos",
@@ -28,6 +33,11 @@ HINT_TO_CANONICAL = {
     "santander": "Santander",
     "lloyds": "Lloyds Bank",
     "lloyds bank": "Lloyds Bank",
+    "classic": "Lloyds Bank",
+    "club lloyds": "Lloyds Bank",
+    "money in": "Lloyds Bank",
+    "money out": "Lloyds Bank",
+    "balance on": "Lloyds Bank",
     "halifax": "Halifax",
     "bank of scotland": "Bank of Scotland",
     "bos": "Bank of Scotland",
@@ -42,7 +52,7 @@ BANK_ADAPTERS = {
 
 BANK_SIGNATURES = {
     "Santander": ["santander uk plc", "santander"],
-    "Lloyds Bank": ["lloyds bank", "lloyds"],
+    "Lloyds Bank": ["lloyds bank", "lloyds", "classic", "club lloyds", "money in", "money out", "balance on"],
     "Halifax": ["halifax"],
     "Bank of Scotland": ["bank of scotland"],
 }

@@ -84,6 +84,7 @@ def reconcile(statement: Dict[str, Optional[float]], transactions: list) -> Dict
     statement_total_debits = statement.get("total_debits")
     statement_total_credits = statement.get("total_credits")
     closing_balance = statement.get("closing_balance")
+    opening_balance = statement.get("opening_balance")
     derived_opening_balance = statement.get("derived_opening_balance")
 
     if statement_total_debits is None or statement_total_credits is None:
@@ -94,13 +95,21 @@ def reconcile(statement: Dict[str, Optional[float]], transactions: list) -> Dict
             "statement_total_debits": statement_total_debits,
             "statement_total_credits": statement_total_credits,
             "closing_balance": closing_balance,
+            "opening_balance": opening_balance,
             "derived_opening_balance": derived_opening_balance,
             "difference": None,
         }
 
     debit_match = abs(calculated_total_debits - statement_total_debits) <= 0.01
     credit_match = abs(calculated_total_credits - statement_total_credits) <= 0.01
-    status = "matched" if debit_match and credit_match else "failed_reconciliation"
+    balance_match = True
+    if opening_balance is not None and closing_balance is not None:
+        expected_closing_balance = round(
+            opening_balance + statement_total_credits - statement_total_debits, 2
+        )
+        balance_match = abs(expected_closing_balance - closing_balance) <= 0.01
+
+    status = "matched" if debit_match and credit_match and balance_match else "failed_reconciliation"
     difference = round(
         (calculated_total_debits - statement_total_debits)
         + (calculated_total_credits - statement_total_credits),
@@ -114,6 +123,7 @@ def reconcile(statement: Dict[str, Optional[float]], transactions: list) -> Dict
         "statement_total_debits": statement_total_debits,
         "statement_total_credits": statement_total_credits,
         "closing_balance": closing_balance,
+        "opening_balance": opening_balance,
         "derived_opening_balance": derived_opening_balance,
         "difference": difference,
     }

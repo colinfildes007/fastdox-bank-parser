@@ -117,6 +117,6 @@ class LloydsParserTests(unittest.TestCase):
         parser = LloydsStatementParser()
         self.assertTrue(parser.can_parse(context))
         result = parser.parse(context)
-        self.assertEqual(result["bank_name"], "Lloyds Bank")
+        self.assertEqual(result["bank_name"], "Lloyds")
         self.assertEqual(len(result["transactions"]), 1)
         self.assertEqual(result["transactions"][0]["type"], "credit")

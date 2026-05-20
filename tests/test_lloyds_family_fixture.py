@@ -73,6 +73,10 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
         self.expected_halifax = json.loads(
             Path("tests/fixtures/lloyds_family/expected_output_halifax.json").read_text()
         )
+        self.lloyds_2026_fixture_path = Path("tests/fixtures/lloyds_family/Statement_2026_lloyds.pdf")
+        self.expected_2026 = json.loads(
+            Path("tests/fixtures/lloyds_family/expected_output_2026_lloyds.json").read_text()
+        )
 
     def _post_pdf(self, pdf_bytes):
         files = {
@@ -155,6 +159,23 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
                 ),
                 f"Expected transaction not found: {expected_tx}",
             )
+
+    def test_lloyds_classic_summary_statement_reconciles(self):
+        pdf_bytes = self.lloyds_2026_fixture_path.read_bytes()
+        response = self._post_pdf(pdf_bytes)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+
+        self.assertEqual(body["status"], "success")
+        self.assertEqual(body["detected_bank"], "Lloyds Bank")
+        self.assertEqual(body["parser_adapter"], "lloyds_family_v1")
+        self.assertEqual(body["statement"]["bank_name"], "Lloyds")
+        self.assertEqual(body["statement"]["opening_balance"], self.expected_2026["opening_balance"])
+        self.assertEqual(body["statement"]["closing_balance"], self.expected_2026["closing_balance"])
+        self.assertEqual(body["statement"]["total_credits"], self.expected_2026["total_credits"])
+        self.assertEqual(body["statement"]["total_debits"], self.expected_2026["total_debits"])
+        self.assertEqual(body["reconciliation"]["status"], self.expected_2026["reconciliation_status"])
+        self.assertTrue(body["parser_debug"]["summary_block_found"])
 
     def test_health_includes_available_adapters(self):
         response = self.client.get("/health")
