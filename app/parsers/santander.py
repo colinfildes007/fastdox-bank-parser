@@ -61,6 +61,7 @@ class SantanderStatementParser(BaseStatementParser):
     bank_name = "Santander"
     parser_name = "santander_text_v1"
     parser_adapter = "santander_v1"
+    adapter_version = "1.0.0"
 
     def can_parse(self, context: Dict) -> bool:
         bank_hint = context.get("bank_hint") or ""

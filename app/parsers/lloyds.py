@@ -89,6 +89,7 @@ class LloydsStatementParser(BaseStatementParser):
     bank_name = "Lloyds"
     parser_name = "lloyds_family_text_v1"
     parser_adapter = "lloyds_family_v1"
+    adapter_version = "1.0.1"
 
     def can_parse(self, context: Dict) -> bool:
         bank_hint = (context.get("bank_hint") or "").lower()
@@ -211,6 +212,7 @@ class LloydsStatementParser(BaseStatementParser):
                     "per_page_transaction_counts": per_page_transaction_counts,
                     "first_5_date_matches": transaction_debug.get("first_5_date_matches", []),
                     "first_5_candidate_blocks": transaction_debug.get("first_5_candidate_blocks", []),
+                    "transaction_section_sample": transaction_debug.get("transaction_section_sample", []),
                     "first_transaction": first_transaction,
                     "last_transaction": last_transaction,
                     "transaction_rows": sum(page_stat.get("transaction_rows", 0) for page_stat in page_stats),
@@ -323,6 +325,26 @@ class LloydsStatementParser(BaseStatementParser):
 
         return summary
 
+    def _sample_transaction_lines(self, doc_text: str, limit: int = 30) -> List[str]:
+        """First non-empty lines after the first "Your Transactions" banner —
+        a window onto the exact extracted-text shape for diagnostics."""
+        sample: List[str] = []
+        collecting = False
+        for raw in doc_text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if not collecting:
+                if "your transactions" in line.lower():
+                    collecting = True
+                continue
+            if line.lower().startswith("transaction types"):
+                break
+            sample.append(line)
+            if len(sample) >= limit:
+                break
+        return sample
+
     def _parse_transactions(
         self,
         pages: List[Dict],
@@ -344,6 +366,10 @@ class LloydsStatementParser(BaseStatementParser):
             "candidate_transaction_blocks": 0,
             "first_5_date_matches": [],
             "first_5_candidate_blocks": [],
+            # Raw lines the parser actually iterates after the first "Your
+            # Transactions" banner. Surfaced so the exact extracted-text shape
+            # can be inspected when no rows match.
+            "transaction_section_sample": self._sample_transaction_lines(doc_text),
         }
 
         # Document-level routing: a statement carrying Money In / Money Out
@@ -550,14 +576,33 @@ class LloydsStatementParser(BaseStatementParser):
                     )
                     note_candidate(current["transaction_date"], line)
                 pending = None
-            elif pending is not None:
+                continue
+
+            if pending is not None:
                 if pending == "type":
                     note_type(line)
                 self._assign_labeled_field(current, pending, line)
                 pending = None
+                continue
+
+            # No pending label: a standalone date line still starts a new
+            # transaction. Covers layouts that omit the "Date" caption.
+            if self._is_bare_date_line(line):
+                finalize()
+                current = self._new_labeled_block()
+                current["transaction_date"] = self._parse_date(
+                    line,
+                    statement_start_date=statement_start_date,
+                    statement_end_date=statement_end_date,
+                )
+                note_candidate(current["transaction_date"], line)
 
         finalize()
         return transactions
+
+    def _is_bare_date_line(self, line: str) -> bool:
+        """A line that is only a date, optionally with a trailing full stop."""
+        return bool(re.fullmatch(r"\d{1,2}\s+[A-Za-z]{3}\s+\d{2,4}\.?", line.strip()))
 
     def _looks_like_flat_row(self, line: str) -> bool:
         """Cheap check: a line that starts with a row date and ends with a run

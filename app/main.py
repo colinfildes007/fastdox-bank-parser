@@ -12,11 +12,40 @@ from app.services.reconciliation import reconcile
 from app.services.text_extractor import extract_pdf_text
 
 
-PARSER_VERSION = os.getenv("PARSER_VERSION", "santander_v1.0.0")
+PARSER_VERSION = os.getenv("PARSER_VERSION", "fastdox_parser_v1.1.0")
 PARSER_API_KEY = os.getenv("PARSER_API_KEY", "")
+SERVICE_NAME = "fastdox-bank-parser"
+# Render injects RENDER_GIT_COMMIT / RENDER_GIT_BRANCH at runtime; fall back to
+# a plain GIT_COMMIT env var or "unknown" so /health always answers.
+GIT_COMMIT = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown"
+GIT_BRANCH = os.getenv("RENDER_GIT_BRANCH") or os.getenv("GIT_BRANCH") or "unknown"
 
 
 app = FastAPI(title="FastDox Bank Parser", version=PARSER_VERSION)
+
+
+def _adapter_info() -> Dict[str, Any]:
+    """Adapters and their versions, derived from the registered parsers."""
+    adapters = []
+    versions: Dict[str, str] = {}
+    for parser in available_parsers():
+        adapter = getattr(parser, "parser_adapter", None)
+        if adapter and adapter not in adapters:
+            adapters.append(adapter)
+            versions[adapter] = getattr(parser, "adapter_version", "unknown")
+    return {"available_adapters": adapters, "adapter_versions": versions}
+
+
+def _version_payload() -> Dict[str, Any]:
+    info = _adapter_info()
+    return {
+        "service_name": SERVICE_NAME,
+        "parser_version": PARSER_VERSION,
+        "available_adapters": info["available_adapters"],
+        "adapter_versions": info["adapter_versions"],
+        "git_commit": GIT_COMMIT,
+        "git_branch": GIT_BRANCH,
+    }
 
 
 def require_auth(authorization: Optional[str]) -> None:
@@ -30,17 +59,26 @@ def require_auth(authorization: Optional[str]) -> None:
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    adapters = []
-    for parser in available_parsers():
-        adapter = getattr(parser, "parser_adapter", None)
-        if adapter and adapter not in adapters:
-            adapters.append(adapter)
-
+    payload = _version_payload()
     return {
         "status": "ok",
-        "service": "fastdox-bank-parser",
-        "parser_version": PARSER_VERSION,
-        "available_adapters": adapters,
+        "service": SERVICE_NAME,
+        **payload,
+    }
+
+
+@app.get("/version")
+def version() -> Dict[str, Any]:
+    return _version_payload()
+
+
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "service": SERVICE_NAME,
+        "endpoints": ["/health", "/version", "/extract", "/extract-upload"],
+        **_version_payload(),
     }
 
 

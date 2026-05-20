@@ -697,6 +697,19 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
         self.assertIn("santander_v1", body["available_adapters"])
         self.assertIn("lloyds_family_v1", body["available_adapters"])
 
+    def test_health_and_version_expose_deploy_identity(self):
+        for path in ("/health", "/version"):
+            body = self.client.get(path).json()
+            self.assertEqual(body["service_name"], "fastdox-bank-parser")
+            self.assertEqual(body["parser_version"], "fastdox_parser_v1.1.0")
+            self.assertEqual(body["adapter_versions"]["lloyds_family_v1"], "1.0.1")
+            self.assertEqual(body["adapter_versions"]["santander_v1"], "1.0.0")
+            self.assertIn("git_commit", body)
+
+        root = self.client.get("/")
+        self.assertEqual(root.status_code, 200)
+        self.assertIn("/extract-upload", root.json()["endpoints"])
+
     def test_santander_regression_still_passes(self):
         pdf_bytes = build_santander_statement_pdf()
         response = self._post_pdf(pdf_bytes)
