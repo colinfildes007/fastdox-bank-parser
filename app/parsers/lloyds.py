@@ -43,6 +43,19 @@ SUMMARY_KEYWORDS = [
     "classic",
     "club lloyds",
 ]
+LABEL_FIELDS = {
+    "date",
+    "description",
+    "type",
+    "money in",
+    "money in (£)",
+    "money out",
+    "money out (£)",
+    "balance",
+    "balance (£)",
+    "your transactions",
+    "transaction types",
+}
 MONTH_MAP = {
     "jan": "01",
     "feb": "02",
@@ -128,6 +141,9 @@ class LloydsStatementParser(BaseStatementParser):
             derived_opening_balance = round(closing_balance - statement_total_credits + statement_total_debits, 2)
             opening_balance = derived_opening_balance
 
+        calculated_total_credits = round(sum(float(tx.get("paid_in", 0.0)) for tx in transactions), 2)
+        calculated_total_debits = round(sum(float(tx.get("paid_out", 0.0)) for tx in transactions), 2)
+
         statement = {
             "bank_name": self.bank_name,
             "account_holder": statement_info["account_holder"],
@@ -144,6 +160,10 @@ class LloydsStatementParser(BaseStatementParser):
         }
         reconciliation_result = reconcile(statement, transactions)
 
+        first_transaction = transactions[0] if transactions else None
+        last_transaction = transactions[-1] if transactions else None
+        per_page_transaction_counts = {str(page_stat["page_number"]): page_stat["transaction_rows"] for page_stat in page_stats}
+
         response = self.build_response(context)
         response.update(
             {
@@ -159,12 +179,20 @@ class LloydsStatementParser(BaseStatementParser):
                     "page_count": page_count,
                     "text_layer_detected": context.get("text_layer_detected", False),
                     "ocr_used": False,
+                    "parser_adapter": self.parser_adapter,
                     "summary_block_found": summary.get("summary_block_found", False),
                     "money_in_found": summary.get("money_in") is not None,
                     "money_out_found": summary.get("money_out") is not None,
                     "opening_balance_found": summary.get("opening_balance") is not None,
                     "closing_balance_found": summary.get("closing_balance") is not None,
-                    "transaction_rows_detected": sum(page_stat.get("transaction_rows", 0) for page_stat in page_stats),
+                    "balance_points_found": summary.get("balance_points", []),
+                    "transaction_rows_detected": len(transactions),
+                    "calculated_total_credits": calculated_total_credits,
+                    "calculated_total_debits": calculated_total_debits,
+                    "per_page_transaction_counts": per_page_transaction_counts,
+                    "first_transaction": first_transaction,
+                    "last_transaction": last_transaction,
+                    "transaction_rows": sum(page_stat.get("transaction_rows", 0) for page_stat in page_stats),
                     "pages": page_stats,
                 },
             }
@@ -230,6 +258,7 @@ class LloydsStatementParser(BaseStatementParser):
             "closing_balance": None,
             "statement_start_date": None,
             "statement_end_date": None,
+            "balance_points": [],
         }
 
         money_in_match = MONEY_IN_PATTERN.search(text)
@@ -247,10 +276,24 @@ class LloydsStatementParser(BaseStatementParser):
             summary["opening_balance"] = self._parse_money(opening_match.group(1))
             summary["summary_block_found"] = True
 
-        balance_on_match = BALANCE_ON_PATTERN.search(text)
-        if balance_on_match:
-            summary["statement_end_date"] = self._parse_date(balance_on_match.group(1))
-            summary["closing_balance"] = self._parse_money(balance_on_match.group(2))
+        balance_points = []
+        for match in BALANCE_ON_PATTERN.finditer(text):
+            point_date = self._parse_date(match.group(1))
+            point_amount = self._parse_money(match.group(2))
+            balance_points.append({"date": point_date, "amount": point_amount})
+
+        if balance_points:
+            balance_points.sort(key=lambda point: point["date"])
+            summary["opening_balance"] = balance_points[0]["amount"]
+            summary["closing_balance"] = balance_points[-1]["amount"]
+            summary["balance_points"] = [
+                {
+                    "date": point["date"],
+                    "amount": point["amount"],
+                    "role": "opening_balance" if index == 0 else "closing_balance" if index == len(balance_points) - 1 else "balance_point",
+                }
+                for index, point in enumerate(balance_points)
+            ]
             summary["summary_block_found"] = True
 
         statement_start_date, statement_end_date = self._extract_statement_period(text)
@@ -271,32 +314,45 @@ class LloydsStatementParser(BaseStatementParser):
 
         for page in pages:
             page_text = page.get("text", "")
-            page_order = self._detect_amount_column_order(page_text)
-            blocks = self._build_transaction_blocks([page])
+            page_number = page.get("page_number")
             page_credit = 0.0
             page_debit = 0.0
             page_rows = 0
+            page_transactions: List[Dict] = []
 
-            for page_number, block in blocks:
-                transaction = self._parse_transaction_block(
-                    block,
+            if self._page_contains_labeled_transactions(page_text):
+                page_transactions = self._parse_labeled_transactions(
+                    page_text,
                     page_number,
                     statement_start_date,
                     statement_end_date,
-                    amount_order=page_order,
                 )
-                if transaction:
-                    parsed.append(transaction)
-                    page_credit += float(transaction.get("credit", 0.0))
-                    page_debit += float(transaction.get("debit", 0.0))
-                    page_rows += 1
-                else:
-                    issues.append("transaction_parse_failed")
+            else:
+                page_order = self._detect_amount_column_order(page_text)
+                blocks = self._build_transaction_blocks([page])
+                for _, block in blocks:
+                    transaction = self._parse_transaction_block(
+                        block,
+                        page_number,
+                        statement_start_date,
+                        statement_end_date,
+                        amount_order=page_order,
+                    )
+                    if transaction:
+                        page_transactions.append(transaction)
+                    else:
+                        issues.append("transaction_parse_failed")
+
+            for transaction in page_transactions:
+                parsed.append(transaction)
+                page_credit += float(transaction.get("paid_in", 0.0))
+                page_debit += float(transaction.get("paid_out", 0.0))
+                page_rows += 1
 
             page_stats.append(
                 {
-                    "page_number": page.get("page_number"),
-                    "transaction_blocks": len(blocks),
+                    "page_number": page_number,
+                    "transaction_blocks": len(page_transactions),
                     "transaction_rows": page_rows,
                     "total_credit": round(page_credit, 2),
                     "total_debit": round(page_debit, 2),
@@ -306,6 +362,142 @@ class LloydsStatementParser(BaseStatementParser):
 
         parsed = self._assign_directions(parsed, issues)
         return parsed, page_stats, issues
+
+    def _page_contains_labeled_transactions(self, page_text: str) -> bool:
+        lower_text = page_text.lower()
+        return (
+            "your transactions" in lower_text
+            or "transaction types" in lower_text
+            or ("money in (£)" in lower_text and "money out (£)" in lower_text and "balance (£)" in lower_text)
+        )
+
+    def _parse_labeled_transactions(
+        self,
+        page_text: str,
+        page_number: Optional[int],
+        statement_start_date: Optional[str],
+        statement_end_date: Optional[str],
+    ) -> List[Dict]:
+        lines = [line.strip() for line in page_text.splitlines() if line.strip()]
+        transactions: List[Dict] = []
+        current: Dict[str, Optional[object]] = {
+            "transaction_date": None,
+            "description_raw": None,
+            "transaction_type": None,
+            "paid_in": 0.0,
+            "paid_out": 0.0,
+            "balance_after": None,
+        }
+        index = 0
+
+        while index < len(lines):
+            line = lines[index].strip()
+            lower_line = line.lower()
+
+            if lower_line == "transaction types":
+                break
+
+            if lower_line == "date":
+                value, next_index = self._extract_label_value(lines, index)
+                if value and DATE_PATTERN.search(value):
+                    if current.get("transaction_date") is not None:
+                        self._append_labeled_transaction(transactions, current, page_number)
+                        current = {
+                            "transaction_date": None,
+                            "description_raw": None,
+                            "transaction_type": None,
+                            "paid_in": 0.0,
+                            "paid_out": 0.0,
+                            "balance_after": None,
+                        }
+                    current["transaction_date"] = self._parse_date(
+                        value,
+                        statement_start_date=statement_start_date,
+                        statement_end_date=statement_end_date,
+                    )
+                index = next_index
+                continue
+
+            if DATE_PATTERN.fullmatch(line):
+                if current.get("transaction_date") is not None:
+                    self._append_labeled_transaction(transactions, current, page_number)
+                    current = {
+                        "transaction_date": None,
+                        "description_raw": None,
+                        "transaction_type": None,
+                        "paid_in": 0.0,
+                        "paid_out": 0.0,
+                        "balance_after": None,
+                    }
+                current["transaction_date"] = self._parse_date(
+                    line,
+                    statement_start_date=statement_start_date,
+                    statement_end_date=statement_end_date,
+                )
+                index += 1
+                continue
+
+            if lower_line in LABEL_FIELDS:
+                value, next_index = self._extract_label_value(lines, index)
+                if lower_line.startswith("description"):
+                    current["description_raw"] = value or ""
+                elif lower_line == "type":
+                    current["transaction_type"] = value or ""
+                elif lower_line.startswith("money in"):
+                    current["paid_in"] = self._parse_money(value) if value else 0.0
+                elif lower_line.startswith("money out"):
+                    current["paid_out"] = self._parse_money(value) if value else 0.0
+                elif lower_line.startswith("balance"):
+                    current["balance_after"] = self._parse_money(value) if value else None
+                index = next_index
+                continue
+
+            index += 1
+
+        if current.get("transaction_date") is not None:
+            self._append_labeled_transaction(transactions, current, page_number)
+
+        return transactions
+
+    def _extract_label_value(self, lines: List[str], index: int) -> Tuple[Optional[str], int]:
+        next_index = index + 1
+        while next_index < len(lines):
+            candidate = lines[next_index].strip()
+            if not candidate:
+                next_index += 1
+                continue
+            if candidate.lower() in LABEL_FIELDS:
+                return None, next_index
+            return candidate, next_index + 1
+        return None, next_index
+
+    def _append_labeled_transaction(self, transactions: List[Dict], current: Dict[str, Optional[object]], page_number: Optional[int]) -> None:
+        if current.get("transaction_date") is None or current.get("balance_after") is None:
+            return
+
+        paid_in = float(current.get("paid_in", 0.0) or 0.0)
+        paid_out = float(current.get("paid_out", 0.0) or 0.0)
+        amount = paid_in if paid_in > 0 else paid_out
+        transaction_type = "credit" if paid_in > 0 else "debit" if paid_out > 0 else "unknown"
+
+        transactions.append(
+            {
+                "transaction_id": None,
+                "transaction_date": current["transaction_date"],
+                "description_raw": current.get("description_raw") or "",
+                "description_clean": current.get("description_raw") or "",
+                "amount": round(amount, 2),
+                "debit": round(paid_out, 2),
+                "credit": round(paid_in, 2),
+                "paid_out": round(paid_out, 2),
+                "paid_in": round(paid_in, 2),
+                "balance_after": round(float(current["balance_after"]), 2),
+                "type": transaction_type,
+                "page_number": page_number or 0,
+                "row_index": 0,
+                "confidence": 0.95,
+            }
+        )
 
     def _build_transaction_blocks(self, pages: List[Dict]) -> List[tuple]:
         blocks = []
