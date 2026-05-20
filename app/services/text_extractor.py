@@ -1,7 +1,61 @@
-import re
-from typing import Dict
+from typing import Dict, List
 
 import pdfplumber
+
+
+def _safe_extract_tables(page) -> List[List[List[str]]]:
+    """Geometry-based table extraction.
+
+    ``extract_text()`` reads a multi-column / ruled table in document order,
+    which on some bank-statement PDFs interleaves characters across columns
+    ("CDolumn ate" instead of "Column"/"Date"). ``extract_tables()`` instead
+    segments the page by its ruling lines and reads each cell's bounding box,
+    so each cell's text stays intact. Failures are swallowed — the text layer
+    remains available as a fallback.
+    """
+    tables: List[List[List[str]]] = []
+    try:
+        raw_tables = page.extract_tables() or []
+    except Exception:
+        return tables
+
+    for raw_table in raw_tables:
+        rows: List[List[str]] = []
+        for raw_row in raw_table or []:
+            if raw_row is None:
+                continue
+            rows.append([(cell or "").replace("\n", " ").strip() for cell in raw_row])
+        if rows:
+            tables.append(rows)
+    return tables
+
+
+def _reconstruct_text_by_position(page) -> str:
+    """Rebuild the page text from word bounding boxes: words grouped into rows
+    by their vertical position, then ordered left-to-right by x within a row.
+
+    This recovers a sane reading order when ``extract_text()`` interleaves
+    overlapping/multi-column text runs.
+    """
+    try:
+        words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
+    except Exception:
+        return ""
+    if not words:
+        return ""
+
+    rows: Dict[int, list] = {}
+    for word in words:
+        bucket = int(round(float(word.get("top", 0.0)) / 3.0))
+        rows.setdefault(bucket, []).append(word)
+
+    lines = []
+    for bucket in sorted(rows):
+        ordered = sorted(rows[bucket], key=lambda w: float(w.get("x0", 0.0)))
+        line = " ".join(str(w.get("text", "")) for w in ordered).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
 
 
 def extract_pdf_text(pdf_path: str) -> Dict:
@@ -20,6 +74,11 @@ def extract_pdf_text(pdf_path: str) -> Dict:
                     "page_number": index,
                     "text": text,
                     "text_length": len(text),
+                    # Position-aware reconstructions, used by parsers when the
+                    # default text layer is garbled. The plain `text` field is
+                    # left untouched so header/summary parsing is unaffected.
+                    "tables": _safe_extract_tables(page),
+                    "position_text": _reconstruct_text_by_position(page),
                 }
             )
 

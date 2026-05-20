@@ -216,6 +216,8 @@ class LloydsStatementParser(BaseStatementParser):
                     "closing_balance_found": summary.get("closing_balance") is not None,
                     "balance_points_found": summary.get("balance_points", []),
                     "transaction_parser_called": transaction_debug.get("transaction_parser_called", False),
+                    "table_extraction_used": transaction_debug.get("table_extraction_used", False),
+                    "tables_detected": transaction_debug.get("tables_detected", 0),
                     "your_transactions_sections_found": transaction_debug.get("your_transactions_sections_found", 0),
                     "date_matches_found": transaction_debug.get("date_matches_found", 0),
                     "type_matches_found": transaction_debug.get("type_matches_found", 0),
@@ -392,15 +394,30 @@ class LloydsStatementParser(BaseStatementParser):
         # continuation pages that omit the repeated column header.
         lower_doc = doc_text.lower()
         money_column_layout = "money in" in lower_doc and "money out" in lower_doc
+        debug["tables_detected"] = sum(len(page.get("tables", []) or []) for page in pages)
+        debug["table_extraction_used"] = False
 
         for page in pages:
             page_text = page.get("text", "")
+            position_text = page.get("position_text", "") or ""
             page_number = page.get("page_number")
             page_credit = 0.0
             page_debit = 0.0
             page_transactions: List[Dict] = []
 
-            if money_column_layout or self._page_contains_labeled_transactions(page_text):
+            # Strategy 1: geometry-based table extraction. Robust when the text
+            # layer is garbled (characters interleaved across columns).
+            page_transactions = self._parse_table_rows(
+                page.get("tables", []) or [],
+                page_number,
+                statement_start_date,
+                statement_end_date,
+            )
+            if page_transactions:
+                debug["transaction_parser_called"] = True
+                debug["table_extraction_used"] = True
+                self._note_table_debug(debug, page_transactions)
+            elif money_column_layout or self._page_contains_labeled_transactions(page_text):
                 debug["transaction_parser_called"] = True
                 page_transactions = self._parse_labeled_transactions(
                     page_text,
@@ -409,6 +426,16 @@ class LloydsStatementParser(BaseStatementParser):
                     statement_end_date,
                     debug,
                 )
+                # Strategy 2b: retry on position-reconstructed text when the
+                # default text layer produced nothing.
+                if not page_transactions and position_text and position_text != page_text:
+                    page_transactions = self._parse_labeled_transactions(
+                        position_text,
+                        page_number,
+                        statement_start_date,
+                        statement_end_date,
+                        debug,
+                    )
             else:
                 page_order = self._detect_amount_column_order(page_text)
                 blocks = self._build_transaction_blocks([page])
@@ -444,6 +471,83 @@ class LloydsStatementParser(BaseStatementParser):
 
         parsed = self._assign_directions(parsed, issues)
         return parsed, page_stats, issues, debug
+
+    def _parse_table_rows(
+        self,
+        tables: List[List[List[str]]],
+        page_number: Optional[int],
+        statement_start_date: Optional[str],
+        statement_end_date: Optional[str],
+    ) -> List[Dict]:
+        """Build transactions from geometry-extracted table rows."""
+        transactions: List[Dict] = []
+        for table in tables:
+            for row in table:
+                transaction = self._transaction_from_table_row(
+                    row, page_number, statement_start_date, statement_end_date
+                )
+                if transaction is not None:
+                    transaction["row_index"] = len(transactions) + 1
+                    transactions.append(transaction)
+        return transactions
+
+    def _transaction_from_table_row(
+        self,
+        row: List[str],
+        page_number: Optional[int],
+        statement_start_date: Optional[str],
+        statement_end_date: Optional[str],
+    ) -> Optional[Dict]:
+        """Map one table row to a transaction, in the fixed Lloyds column order
+        Date, Description, Type, Money In, Money Out, Balance."""
+        cells = [(str(cell).strip() if cell is not None else "") for cell in row]
+
+        date_index = None
+        for index, cell in enumerate(cells):
+            if cell and LLOYDS_ROW_DATE_PATTERN.match(cell):
+                date_index = index
+                break
+        if date_index is None:
+            return None
+
+        fields = cells[date_index:]
+        if len(fields) < 6:
+            return None
+
+        date_cell, desc_cell, type_cell, money_in_cell, money_out_cell, balance_cell = fields[:6]
+        balance = self._parse_money_or_none(balance_cell)
+        if balance is None:
+            return None
+
+        block = self._new_labeled_block()
+        block["transaction_date"] = self._parse_date(
+            date_cell,
+            statement_start_date=statement_start_date,
+            statement_end_date=statement_end_date,
+        )
+        block["description_raw"] = self._clean_labeled_value(desc_cell)
+        block["transaction_type"] = self._clean_labeled_value(type_cell)
+        block["paid_in"] = self._parse_money(money_in_cell)
+        block["paid_out"] = self._parse_money(money_out_cell)
+        block["balance_after"] = balance
+        return self._build_transaction(block, page_number)
+
+    def _note_table_debug(self, debug: Dict, transactions: List[Dict]) -> None:
+        for transaction in transactions:
+            debug["date_matches_found"] = debug.get("date_matches_found", 0) + 1
+            debug["candidate_transaction_blocks"] = debug.get("candidate_transaction_blocks", 0) + 1
+            if (transaction.get("transaction_type") or "").rstrip(".").upper() in TRANSACTION_TYPE_CODES:
+                debug["type_matches_found"] = debug.get("type_matches_found", 0) + 1
+            first_dates = debug.setdefault("first_5_date_matches", [])
+            first_blocks = debug.setdefault("first_5_candidate_blocks", [])
+            if len(first_dates) < 5:
+                first_dates.append(transaction.get("transaction_date"))
+            if len(first_blocks) < 5:
+                first_blocks.append(
+                    f"{transaction.get('transaction_date')} "
+                    f"{transaction.get('description_raw')} "
+                    f"{transaction.get('transaction_type')}"
+                )
 
     def _page_contains_labeled_transactions(self, page_text: str) -> bool:
         lower_text = page_text.lower()

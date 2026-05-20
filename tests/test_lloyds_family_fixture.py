@@ -428,6 +428,71 @@ def build_lloyds_merged_blocks_pdf():
     return doc.write()
 
 
+def build_lloyds_ruled_table_pdf():
+    """A Lloyds 'Classic' statement drawn as a real ruled table (visible cell
+    borders), so pdfplumber segments it by geometry via extract_tables() rather
+    than the (garbled) document-order text layer."""
+    import fitz
+
+    col_x = [40, 110, 250, 312, 396, 476, 560]  # 6 columns -> 7 boundaries
+    headers = ["Date", "Description", "Type", "Money In (£)", "Money Out (£)", "Balance (£)"]
+
+    def cell_amount(value):
+        return "" if value is None else f"{value:,.2f}"
+
+    pages_rows = {1: [], 2: [], 3: []}
+    for (page_number, date, desc, ttype, money_in, money_out, balance) in LLOYDS_REAL_TRANSACTIONS:
+        pages_rows[page_number].append(
+            [date, desc, ttype, cell_amount(money_in), cell_amount(money_out), f"{balance:,.2f}"]
+        )
+
+    intros = {
+        1: [
+            "Lloyds Bank plc",
+            "Classic statement",
+            "Sort Code 77-19-26  Account Number 41496768",
+            "Statement period 01 Jan 26 to 31 Jan 26",
+            "Money In £6,537.00   Money Out £6,437.60",
+            "Balance on 01 January 2026 £173.00",
+            "Balance on 31 January 2026 £272.40",
+            "Your Transactions",
+        ],
+        2: ["Lloyds Bank plc", "CLASSIC Sort Code 77-19-26", "Your Transactions"],
+        3: ["Lloyds Bank plc", "CLASSIC Sort Code 77-19-26", "Your Transactions"],
+    }
+
+    doc = fitz.open()
+    for page_number in (1, 2, 3):
+        intro = intros[page_number]
+        rows = pages_rows[page_number]
+        row_height = 16
+        table_top = 60 + len(intro) * 13 + 16
+        line_count = len(rows) + 1  # header row + data rows
+        table_bottom = table_top + line_count * row_height
+        page = doc.new_page(width=600, height=table_bottom + 60)
+
+        y = 50
+        for line in intro:
+            page.insert_text((40, y), line, fontsize=8)
+            y += 13
+
+        for r in range(line_count + 1):
+            yy = table_top + r * row_height
+            page.draw_line((col_x[0], yy), (col_x[-1], yy), width=0.6)
+        for x in col_x:
+            page.draw_line((x, table_top), (x, table_bottom), width=0.6)
+
+        for c, header in enumerate(headers):
+            page.insert_text((col_x[c] + 3, table_top + 11), header, fontsize=7)
+        for ri, row in enumerate(rows, start=1):
+            text_y = table_top + ri * row_height + 11
+            for c, value in enumerate(row):
+                if value:
+                    page.insert_text((col_x[c] + 3, text_y), str(value), fontsize=7)
+
+    return doc.write()
+
+
 class LloydsFamilyFixtureTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
@@ -804,6 +869,50 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
 
         htec = by_desc["HTEC SOLUTIO LTD"][0]
         self.assertEqual(htec["paid_in"], 3000.0)
+
+    def test_lloyds_ruled_table_extraction_reconciles(self):
+        pdf_bytes = build_lloyds_ruled_table_pdf()
+        response = self._post_pdf(pdf_bytes)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+
+        self.assertEqual(body["status"], "success")
+        self.assertEqual(body["detected_bank"], "Lloyds Bank")
+        self.assertEqual(body["parser_adapter"], "lloyds_family_v1")
+        self.assertEqual(body["page_count"], 3)
+        self.assertEqual(body["transaction_count"], 55)
+
+        self.assertEqual(body["statement"]["opening_balance"], 173.0)
+        self.assertEqual(body["statement"]["closing_balance"], 272.4)
+        self.assertEqual(body["statement"]["total_credits"], 6537.0)
+        self.assertEqual(body["statement"]["total_debits"], 6437.6)
+
+        recon = body["reconciliation"]
+        self.assertEqual(recon["status"], "matched")
+        self.assertEqual(recon["calculated_total_credits"], 6537.0)
+        self.assertEqual(recon["calculated_total_debits"], 6437.6)
+
+        debug = body["parser_debug"]
+        self.assertTrue(debug["transaction_parser_called"])
+        self.assertTrue(debug["table_extraction_used"])
+        self.assertGreaterEqual(debug["tables_detected"], 3)
+        self.assertEqual(debug["transactions_returned"], 55)
+        self.assertEqual(debug["per_page_transaction_counts"], {"1": 16, "2": 22, "3": 17})
+
+        by_desc = {}
+        for tx in body["transactions"]:
+            by_desc.setdefault(tx["description_raw"], []).append(tx)
+
+        rochdale = by_desc["ROCHDALE MBC"][0]
+        self.assertEqual(rochdale["transaction_date"], "2026-01-02")
+        self.assertEqual(rochdale["transaction_type"], "DD")
+        self.assertEqual(rochdale["paid_in"], 0.0)
+        self.assertEqual(rochdale["paid_out"], 164.0)
+        self.assertEqual(rochdale["balance_after"], 9.0)
+
+        htec = by_desc["HTEC SOLUTIO LTD"][0]
+        self.assertEqual(htec["paid_in"], 3000.0)
+        self.assertEqual(htec["transaction_type"], "FPI")
 
     def test_health_includes_available_adapters(self):
         response = self.client.get("/health")
