@@ -1008,6 +1008,101 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
         ]
         self.assertEqual(len(identities), len(set(identities)))
 
+    def test_lloyds_phase1_acceptance_regression(self):
+        """Frozen Phase 1 acceptance result for the real Lloyds 'Classic'
+        Statement_2026_lloyds.pdf (55-transaction statement).
+
+        This guards the Lloyds parser: it fails if transaction_count drifts,
+        the calculated totals stop matching the statement totals, reconciliation
+        is not "matched", a duplicate is reported, the wrong adapter is used, or
+        transactions[] comes back empty.
+        """
+        expected = json.loads(
+            Path("tests/fixtures/lloyds_family/expected_output_lloyds_acceptance.json").read_text()
+        )
+
+        pdf_bytes = build_lloyds_merged_blocks_pdf()
+        response = self._post_pdf(pdf_bytes)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+
+        # --- parser identity ---
+        self.assertEqual(body["status"], "success")
+        self.assertEqual(body["detected_bank"], expected["detected_bank"])
+        self.assertEqual(body["parser_adapter"], expected["parser_adapter"])
+        self.assertEqual(body["parser_debug"]["adapter_selected"], "lloyds_family_v1")
+        self.assertEqual(body["parser_debug"]["parser_adapter"], "lloyds_family_v1")
+        self.assertTrue(body["parser_debug"]["transaction_parser_called"])
+
+        # --- transaction count is frozen, and transactions[] is populated ---
+        self.assertEqual(body["transaction_count"], expected["transaction_count"])
+        self.assertEqual(len(body["transactions"]), expected["transaction_count"])
+        self.assertGreater(len(body["transactions"]), 0)
+
+        # --- statement header ---
+        self.assertEqual(body["statement"]["opening_balance"], expected["opening_balance"])
+        self.assertEqual(body["statement"]["closing_balance"], expected["closing_balance"])
+        self.assertEqual(body["statement"]["total_credits"], expected["statement_total_credits"])
+        self.assertEqual(body["statement"]["total_debits"], expected["statement_total_debits"])
+
+        # --- reconciliation: calculated totals must match the statement totals ---
+        recon = body["reconciliation"]
+        self.assertEqual(recon["status"], expected["reconciliation_status"])
+        self.assertEqual(recon["calculated_total_credits"], expected["calculated_total_credits"])
+        self.assertEqual(recon["calculated_total_debits"], expected["calculated_total_debits"])
+        self.assertEqual(recon["calculated_total_credits"], recon["statement_total_credits"])
+        self.assertEqual(recon["calculated_total_debits"], recon["statement_total_debits"])
+
+        # opening + credits - debits == closing
+        self.assertAlmostEqual(
+            round(
+                expected["opening_balance"]
+                + expected["calculated_total_credits"]
+                - expected["calculated_total_debits"],
+                2,
+            ),
+            expected["closing_balance"],
+            places=2,
+        )
+
+        # --- duplicates ---
+        self.assertEqual(
+            body["parser_debug"]["duplicate_transaction_count"],
+            expected["duplicate_transaction_count"],
+        )
+
+        # --- every transaction carries the required fields ---
+        for tx in body["transactions"]:
+            for field in ("transaction_date", "description_raw", "paid_in", "paid_out", "balance_after"):
+                self.assertIn(field, tx)
+                self.assertIsNotNone(tx[field], f"{field} missing on transaction {tx}")
+
+        # --- no two transactions share a full identity key ---
+        identities = [
+            (
+                tx["transaction_date"],
+                tx["description_raw"],
+                tx.get("transaction_type"),
+                round(float(tx["paid_in"]), 2),
+                round(float(tx["paid_out"]), 2),
+                round(float(tx["balance_after"]), 2),
+            )
+            for tx in body["transactions"]
+        ]
+        self.assertEqual(
+            len(identities), len(set(identities)), "duplicate transaction identity key found"
+        )
+
+        # --- the calculated totals are exactly the sum of the rows ---
+        self.assertEqual(
+            round(sum(float(tx["paid_in"]) for tx in body["transactions"]), 2),
+            expected["calculated_total_credits"],
+        )
+        self.assertEqual(
+            round(sum(float(tx["paid_out"]) for tx in body["transactions"]), 2),
+            expected["calculated_total_debits"],
+        )
+
     def test_health_includes_available_adapters(self):
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)

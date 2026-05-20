@@ -1,0 +1,14 @@
+{
+  "_comment": "Frozen Phase 1 acceptance result for the real Lloyds 'Classic' Statement_2026_lloyds.pdf (55-transaction statement, labelled-block text layer). Reproduced by build_lloyds_merged_blocks_pdf(). Update only with a deliberate, reviewed parser change.",
+  "detected_bank": "Lloyds Bank",
+  "parser_adapter": "lloyds_family_v1",
+  "transaction_count": 55,
+  "opening_balance": 173.0,
+  "closing_balance": 272.4,
+  "statement_total_credits": 6537.0,
+  "statement_total_debits": 6437.6,
+  "calculated_total_credits": 6537.0,
+  "calculated_total_debits": 6437.6,
+  "reconciliation_status": "matched",
+  "duplicate_transaction_count": 0
+}
