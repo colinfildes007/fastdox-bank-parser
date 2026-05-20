@@ -62,6 +62,102 @@ def build_santander_statement_pdf():
     return doc.write()
 
 
+def build_lloyds_blank_format_pdf():
+    """A Lloyds 'Classic' statement in the labelled-block layout.
+
+    Empty money cells are rendered as the literal token 'blank.' (sometimes
+    inline with the label), amounts use comma grouping, and the table spans
+    three pages with a repeated column-header row on page 2.
+    """
+    import fitz
+
+    page_1 = "\n".join(
+        [
+            "Lloyds Bank plc",
+            "Classic statement",
+            "Account name John Smith",
+            "Sort code 30-00-00",
+            "Account number 12345678",
+            "Statement period 01 Jan 26 to 31 Jan 26",
+            "Money In £6,537.00",
+            "Money Out £6,437.60",
+            "Balance on 01 January 2026 £173.00",
+            "Balance on 31 January 2026 £272.40",
+            "Your Transactions",
+            "Date", "01 Jan 26",
+            "Description", "AIDAN SHERWOOD",
+            "Type", "FPI",
+            "Money In (£)", "1,200.00",
+            "Money Out (£) blank.",
+            "Balance (£)", "1,373.00",
+            "Date", "02 Jan 26",
+            "Description", "ROCHDALE MBC",
+            "Type", "DD",
+            "Money In (£) blank.",
+            "Money Out (£)", "15.40",
+            "Balance (£)", "1,357.60",
+            "Date", "03 Jan 26",
+            "Description", "TRANSFER IN",
+            "Type", "FPI",
+            "Money In (£)", "2,000.00",
+            "Money Out (£) blank.",
+            "Balance (£)", "3,357.60",
+        ]
+    )
+
+    page_2 = "\n".join(
+        [
+            "Date Description Type Money In (£) Money Out (£) Balance (£)",
+            "Date", "04 Jan 26",
+            "Description", "SUPERMARKET",
+            "Type", "DD",
+            "Money In (£) blank.",
+            "Money Out (£)", "1,500.00",
+            "Balance (£)", "1,857.60",
+            "Date 05 Jan 26",
+            "Description", "BONUS PAYMENT",
+            "Type", "CR",
+            "Money In (£)", "1,000.00",
+            "Money Out (£) blank.",
+            "Balance (£)", "2,857.60",
+            "Date", "06 Jan 26",
+            "Description", "UTILITY PROVIDER",
+            "Type", "DD",
+            "Money In (£) blank.",
+            "Money Out (£)", "800.00",
+            "Balance (£)", "2,057.60",
+            "Page 2 of 3",
+        ]
+    )
+
+    page_3 = "\n".join(
+        [
+            "Date", "07 Jan 26",
+            "Description", "INSURANCE REFUND",
+            "Type", "FPI",
+            "Money In (£)", "2,337.00",
+            "Money Out (£) blank.",
+            "Balance (£)", "4,394.60",
+            "Date", "08 Jan 26",
+            "Description", "RENT PAYMENT",
+            "Type", "DD",
+            "Money In (£) blank.",
+            "Money Out (£)", "4,122.20",
+            "Balance (£)", "272.40",
+            "Transaction types",
+            "DD Direct Debit",
+            "FPI Faster Payment In",
+            "CR Credit",
+        ]
+    )
+
+    doc = fitz.open()
+    for page_text in (page_1, page_2, page_3):
+        page = doc.new_page()
+        page.insert_text((54, 54), page_text, fontsize=9)
+    return doc.write()
+
+
 class LloydsFamilyFixtureTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
@@ -188,6 +284,70 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
         self.assertEqual(body["parser_debug"]["calculated_total_debits"], self.expected_2026["total_debits"])
         self.assertIsNotNone(body["parser_debug"]["first_transaction"])
         self.assertIsNotNone(body["parser_debug"]["last_transaction"])
+
+    def test_lloyds_blank_format_transactions_extracted(self):
+        pdf_bytes = build_lloyds_blank_format_pdf()
+        response = self._post_pdf(pdf_bytes)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+
+        self.assertEqual(body["status"], "success")
+        self.assertEqual(body["detected_bank"], "Lloyds Bank")
+        self.assertEqual(body["parser_adapter"], "lloyds_family_v1")
+        self.assertEqual(body["page_count"], 3)
+        self.assertEqual(body["transaction_count"], 8)
+
+        self.assertEqual(body["statement"]["opening_balance"], 173.0)
+        self.assertEqual(body["statement"]["closing_balance"], 272.4)
+        self.assertEqual(body["statement"]["total_credits"], 6537.0)
+        self.assertEqual(body["statement"]["total_debits"], 6437.6)
+
+        recon = body["reconciliation"]
+        self.assertEqual(recon["status"], "matched")
+        self.assertEqual(recon["calculated_total_credits"], 6537.0)
+        self.assertEqual(recon["calculated_total_debits"], 6437.6)
+
+        debug = body["parser_debug"]
+        self.assertEqual(debug["adapter_selected"], "lloyds_family_v1")
+        self.assertTrue(debug["header_parsed"])
+        self.assertEqual(debug["transaction_rows_detected"], 8)
+        self.assertEqual(debug["transactions_returned"], 8)
+        self.assertEqual(debug["per_page_transaction_counts"], {"1": 3, "2": 3, "3": 2})
+        self.assertEqual(debug["calculated_total_credits"], 6537.0)
+        self.assertEqual(debug["calculated_total_debits"], 6437.6)
+        self.assertIsNotNone(debug["first_transaction"])
+        self.assertIsNotNone(debug["last_transaction"])
+
+        by_description = {tx["description_raw"]: tx for tx in body["transactions"]}
+        self.assertEqual(len(by_description), 8)
+
+        # Empty Money In cell rendered inline as "blank." -> debit row.
+        rochdale = by_description["ROCHDALE MBC"]
+        self.assertEqual(rochdale["transaction_date"], "2026-01-02")
+        self.assertEqual(rochdale["transaction_type"], "DD")
+        self.assertEqual(rochdale["paid_in"], 0.0)
+        self.assertEqual(rochdale["paid_out"], 15.4)
+        self.assertEqual(rochdale["balance_after"], 1357.6)
+        self.assertEqual(rochdale["type"], "debit")
+
+        # Empty Money Out cell rendered inline as "blank." -> credit row,
+        # with a comma-grouped amount.
+        aidan = by_description["AIDAN SHERWOOD"]
+        self.assertEqual(aidan["transaction_date"], "2026-01-01")
+        self.assertEqual(aidan["transaction_type"], "FPI")
+        self.assertEqual(aidan["paid_in"], 1200.0)
+        self.assertEqual(aidan["paid_out"], 0.0)
+        self.assertEqual(aidan["balance_after"], 1373.0)
+        self.assertEqual(aidan["type"], "credit")
+
+        # Inline "Date 05 Jan 26" row is still detected as a new transaction.
+        bonus = by_description["BONUS PAYMENT"]
+        self.assertEqual(bonus["transaction_date"], "2026-01-05")
+        self.assertEqual(bonus["paid_in"], 1000.0)
+
+        for tx in body["transactions"]:
+            self.assertIn(tx["page_number"], (1, 2, 3))
+            self.assertGreaterEqual(tx["row_index"], 1)
 
     def test_health_includes_available_adapters(self):
         response = self.client.get("/health")

@@ -43,19 +43,18 @@ SUMMARY_KEYWORDS = [
     "classic",
     "club lloyds",
 ]
-LABEL_FIELDS = {
-    "date",
-    "description",
-    "type",
-    "money in",
-    "money in (£)",
-    "money out",
-    "money out (£)",
-    "balance",
-    "balance (£)",
-    "your transactions",
-    "transaction types",
-}
+# Ordered label matchers for the Lloyds labelled-block layout. Each pattern is
+# anchored to the start of a line and tolerates the optional "(£)" suffix, so it
+# matches both a bare label ("Money In (£)") and an inline label+value
+# ("Money In (£) blank.", "Date 02 Jan 26").
+FIELD_LABEL_PATTERNS = [
+    ("money_in", re.compile(r"^money\s*in\b\s*(?:\(\s*£?\s*\))?\s*[:\-]?\s*", re.IGNORECASE)),
+    ("money_out", re.compile(r"^money\s*out\b\s*(?:\(\s*£?\s*\))?\s*[:\-]?\s*", re.IGNORECASE)),
+    ("balance", re.compile(r"^balance\b\s*(?:\(\s*£?\s*\))?\s*[:\-]?\s*", re.IGNORECASE)),
+    ("date", re.compile(r"^date\b\s*[:\-]?\s*", re.IGNORECASE)),
+    ("description", re.compile(r"^description\b\s*[:\-]?\s*", re.IGNORECASE)),
+    ("type", re.compile(r"^type\b\s*[:\-]?\s*", re.IGNORECASE)),
+]
 MONTH_MAP = {
     "jan": "01",
     "feb": "02",
@@ -176,6 +175,7 @@ class LloydsStatementParser(BaseStatementParser):
                 "parser_debug": {
                     "parser_name": self.parser_name,
                     "adapter_selected": self.parser_adapter,
+                    "header_parsed": summary.get("summary_block_found", False),
                     "page_count": page_count,
                     "text_layer_detected": context.get("text_layer_detected", False),
                     "ocr_used": False,
@@ -187,6 +187,7 @@ class LloydsStatementParser(BaseStatementParser):
                     "closing_balance_found": summary.get("closing_balance") is not None,
                     "balance_points_found": summary.get("balance_points", []),
                     "transaction_rows_detected": len(transactions),
+                    "transactions_returned": len(transactions),
                     "calculated_total_credits": calculated_total_credits,
                     "calculated_total_debits": calculated_total_debits,
                     "per_page_transaction_counts": per_page_transaction_counts,
@@ -365,11 +366,18 @@ class LloydsStatementParser(BaseStatementParser):
 
     def _page_contains_labeled_transactions(self, page_text: str) -> bool:
         lower_text = page_text.lower()
-        return (
-            "your transactions" in lower_text
-            or "transaction types" in lower_text
-            or ("money in (£)" in lower_text and "money out (£)" in lower_text and "balance (£)" in lower_text)
-        )
+        if "your transactions" in lower_text or "transaction types" in lower_text:
+            return True
+        # Continuation pages carry no banner: detect the layout by the presence
+        # of the Money In / Money Out / Balance column labels as standalone lines.
+        if "money in" in lower_text and "money out" in lower_text and "balance" in lower_text:
+            label_lines = sum(
+                1
+                for line in page_text.splitlines()
+                if self._match_field_label(line.strip())[0] is not None
+            )
+            return label_lines >= 3
+        return False
 
     def _parse_labeled_transactions(
         self,
@@ -378,9 +386,92 @@ class LloydsStatementParser(BaseStatementParser):
         statement_start_date: Optional[str],
         statement_end_date: Optional[str],
     ) -> List[Dict]:
+        """Convert a labelled-block page into transaction rows.
+
+        Each transaction is rendered as a run of ``label`` / ``value`` lines.
+        The value may sit on the same line as its label ("Money In (£) blank.")
+        or on the following line ("Money In (£)\\n295.00"); empty cells are
+        rendered as the literal token "blank.".
+        """
         lines = [line.strip() for line in page_text.splitlines() if line.strip()]
+
+        # Requirement 1: only parse rows that appear after the "Your
+        # Transactions" banner (continuation pages carry no banner).
+        start_index = 0
+        for index, line in enumerate(lines):
+            if line.lower().startswith("your transactions"):
+                start_index = index + 1
+                break
+
         transactions: List[Dict] = []
-        current: Dict[str, Optional[object]] = {
+        current: Optional[Dict] = None
+        pending: Optional[str] = None
+        row_index = 0
+
+        def finalize() -> None:
+            nonlocal current, row_index
+            if current is not None and current.get("transaction_date") is not None:
+                row_index += 1
+                self._append_labeled_transaction(transactions, current, page_number, row_index)
+            current = None
+
+        for line in lines[start_index:]:
+            # Requirement 2: stop before the "Transaction types" legend on the
+            # final page.
+            if line.lower().startswith("transaction types"):
+                break
+
+            field, inline_value = self._match_field_label(line)
+
+            # Requirement 3: skip a repeated column-header row, e.g.
+            # "Date Description Type Money In (£) ..." — a label whose trailing
+            # text is itself another label.
+            if field is not None and inline_value and self._match_field_label(inline_value)[0] is not None:
+                pending = None
+                continue
+
+            if field is not None:
+                pending = None
+                if field == "date":
+                    # Requirement 4: every Date value starts a new transaction.
+                    if inline_value and DATE_PATTERN.search(inline_value):
+                        finalize()
+                        current = self._new_labeled_block()
+                        current["transaction_date"] = self._parse_date(
+                            inline_value,
+                            statement_start_date=statement_start_date,
+                            statement_end_date=statement_end_date,
+                        )
+                    elif inline_value is None:
+                        pending = "date"
+                    continue
+
+                if inline_value is not None:
+                    self._assign_labeled_field(current, field, inline_value)
+                else:
+                    pending = field
+                continue
+
+            # A non-label line is the value for the most recent bare label.
+            if pending == "date":
+                if DATE_PATTERN.search(line):
+                    finalize()
+                    current = self._new_labeled_block()
+                    current["transaction_date"] = self._parse_date(
+                        line,
+                        statement_start_date=statement_start_date,
+                        statement_end_date=statement_end_date,
+                    )
+                pending = None
+            elif pending is not None:
+                self._assign_labeled_field(current, pending, line)
+                pending = None
+
+        finalize()
+        return transactions
+
+    def _new_labeled_block(self) -> Dict[str, Optional[object]]:
+        return {
             "transaction_date": None,
             "description_raw": None,
             "transaction_type": None,
@@ -388,97 +479,61 @@ class LloydsStatementParser(BaseStatementParser):
             "paid_out": 0.0,
             "balance_after": None,
         }
-        index = 0
 
-        while index < len(lines):
-            line = lines[index].strip()
-            lower_line = line.lower()
+    def _match_field_label(self, line: str) -> Tuple[Optional[str], Optional[str]]:
+        """Return ``(field_name, inline_value)`` if the line starts with a known
+        column label, otherwise ``(None, None)``."""
+        for name, pattern in FIELD_LABEL_PATTERNS:
+            match = pattern.match(line)
+            if match:
+                value = line[match.end():].strip()
+                return name, (value or None)
+        return None, None
 
-            if lower_line == "transaction types":
-                break
+    def _assign_labeled_field(self, current: Optional[Dict], field: str, value: str) -> None:
+        if current is None:
+            return
+        if field == "description":
+            text = self._clean_labeled_value(value)
+            if text:
+                existing = current.get("description_raw")
+                current["description_raw"] = f"{existing} {text}".strip() if existing else text
+        elif field == "type":
+            text = self._clean_labeled_value(value)
+            if text and not current.get("transaction_type"):
+                current["transaction_type"] = text
+        elif field == "money_in":
+            current["paid_in"] = self._parse_money(value)
+        elif field == "money_out":
+            current["paid_out"] = self._parse_money(value)
+        elif field == "balance":
+            balance = self._parse_money_or_none(value)
+            if balance is not None:
+                current["balance_after"] = balance
 
-            if lower_line == "date":
-                value, next_index = self._extract_label_value(lines, index)
-                if value and DATE_PATTERN.search(value):
-                    if current.get("transaction_date") is not None:
-                        self._append_labeled_transaction(transactions, current, page_number)
-                        current = {
-                            "transaction_date": None,
-                            "description_raw": None,
-                            "transaction_type": None,
-                            "paid_in": 0.0,
-                            "paid_out": 0.0,
-                            "balance_after": None,
-                        }
-                    current["transaction_date"] = self._parse_date(
-                        value,
-                        statement_start_date=statement_start_date,
-                        statement_end_date=statement_end_date,
-                    )
-                index = next_index
-                continue
+    def _clean_labeled_value(self, value: Optional[str]) -> str:
+        if value is None:
+            return ""
+        text = re.sub(r"\s{2,}", " ", str(value).strip())
+        # Requirement 6: an empty cell is rendered as the literal token "blank.".
+        if text.lower().rstrip(".") == "blank":
+            return ""
+        return text
 
-            if DATE_PATTERN.fullmatch(line):
-                if current.get("transaction_date") is not None:
-                    self._append_labeled_transaction(transactions, current, page_number)
-                    current = {
-                        "transaction_date": None,
-                        "description_raw": None,
-                        "transaction_type": None,
-                        "paid_in": 0.0,
-                        "paid_out": 0.0,
-                        "balance_after": None,
-                    }
-                current["transaction_date"] = self._parse_date(
-                    line,
-                    statement_start_date=statement_start_date,
-                    statement_end_date=statement_end_date,
-                )
-                index += 1
-                continue
-
-            if lower_line in LABEL_FIELDS:
-                value, next_index = self._extract_label_value(lines, index)
-                if lower_line.startswith("description"):
-                    current["description_raw"] = value or ""
-                elif lower_line == "type":
-                    current["transaction_type"] = value or ""
-                elif lower_line.startswith("money in"):
-                    current["paid_in"] = self._parse_money(value) if value else 0.0
-                elif lower_line.startswith("money out"):
-                    current["paid_out"] = self._parse_money(value) if value else 0.0
-                elif lower_line.startswith("balance"):
-                    current["balance_after"] = self._parse_money(value) if value else None
-                index = next_index
-                continue
-
-            index += 1
-
-        if current.get("transaction_date") is not None:
-            self._append_labeled_transaction(transactions, current, page_number)
-
-        return transactions
-
-    def _extract_label_value(self, lines: List[str], index: int) -> Tuple[Optional[str], int]:
-        next_index = index + 1
-        while next_index < len(lines):
-            candidate = lines[next_index].strip()
-            if not candidate:
-                next_index += 1
-                continue
-            if candidate.lower() in LABEL_FIELDS:
-                return None, next_index
-            return candidate, next_index + 1
-        return None, next_index
-
-    def _append_labeled_transaction(self, transactions: List[Dict], current: Dict[str, Optional[object]], page_number: Optional[int]) -> None:
+    def _append_labeled_transaction(
+        self,
+        transactions: List[Dict],
+        current: Dict[str, Optional[object]],
+        page_number: Optional[int],
+        row_index: int,
+    ) -> None:
         if current.get("transaction_date") is None or current.get("balance_after") is None:
             return
 
         paid_in = float(current.get("paid_in", 0.0) or 0.0)
         paid_out = float(current.get("paid_out", 0.0) or 0.0)
         amount = paid_in if paid_in > 0 else paid_out
-        transaction_type = "credit" if paid_in > 0 else "debit" if paid_out > 0 else "unknown"
+        direction = "credit" if paid_in > 0 else "debit" if paid_out > 0 else "unknown"
 
         transactions.append(
             {
@@ -486,15 +541,16 @@ class LloydsStatementParser(BaseStatementParser):
                 "transaction_date": current["transaction_date"],
                 "description_raw": current.get("description_raw") or "",
                 "description_clean": current.get("description_raw") or "",
+                "transaction_type": current.get("transaction_type") or "",
                 "amount": round(amount, 2),
                 "debit": round(paid_out, 2),
                 "credit": round(paid_in, 2),
                 "paid_out": round(paid_out, 2),
                 "paid_in": round(paid_in, 2),
                 "balance_after": round(float(current["balance_after"]), 2),
-                "type": transaction_type,
+                "type": direction,
                 "page_number": page_number or 0,
-                "row_index": 0,
+                "row_index": row_index,
                 "confidence": 0.95,
             }
         )
@@ -625,8 +681,28 @@ class LloydsStatementParser(BaseStatementParser):
         description = " ".join(description_parts).strip()
         return re.sub(r"\s{2,}", " ", description)
 
-    def _parse_money(self, value: str) -> float:
-        return round(float(value.replace("£", "").replace(",", "")), 2)
+    def _parse_money(self, value: Optional[str]) -> float:
+        parsed = self._parse_money_or_none(value)
+        return parsed if parsed is not None else 0.0
+
+    def _parse_money_or_none(self, value: Optional[str]) -> Optional[float]:
+        """Parse a money cell, tolerating £ signs, comma grouping (3,000.00) and
+        the "blank." empty-cell token. Returns ``None`` when no amount is found."""
+        if value is None:
+            return None
+        text = str(value).strip()
+        # Requirement 6: "blank." (and similar empty markers) means no amount.
+        if not text or "blank" in text.lower():
+            return None
+        # Requirement 7: drop the £ sign and comma thousands separators.
+        cleaned = text.replace("£", "").replace(",", "")
+        match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+        if not match:
+            return None
+        try:
+            return round(float(match.group()), 2)
+        except ValueError:
+            return None
 
     def _parse_date(
         self,
@@ -732,7 +808,10 @@ class LloydsStatementParser(BaseStatementParser):
                 if "unknown_direction" not in issues:
                     issues.append("unknown_direction")
 
-            transaction["row_index"] = index + 1
+            # Requirement 8: preserve a row_index already assigned by the
+            # labelled-block parser; only fill it in for the block-based path.
+            if not transaction.get("row_index"):
+                transaction["row_index"] = index + 1
 
         return transactions
 
