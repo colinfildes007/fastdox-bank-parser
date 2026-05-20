@@ -459,16 +459,20 @@ class LloydsStatementParser(BaseStatementParser):
         def note_candidate(date_value: Optional[str], source_line: str) -> None:
             if debug is None:
                 return
-            debug["date_matches_found"] += 1
-            debug["candidate_transaction_blocks"] += 1
-            if len(debug["first_5_date_matches"]) < 5:
-                debug["first_5_date_matches"].append(date_value)
-            if len(debug["first_5_candidate_blocks"]) < 5:
-                debug["first_5_candidate_blocks"].append(source_line)
+            debug["date_matches_found"] = debug.get("date_matches_found", 0) + 1
+            debug["candidate_transaction_blocks"] = debug.get("candidate_transaction_blocks", 0) + 1
+            first_dates = debug.setdefault("first_5_date_matches", [])
+            first_blocks = debug.setdefault("first_5_candidate_blocks", [])
+            if len(first_dates) < 5:
+                first_dates.append(date_value)
+            if len(first_blocks) < 5:
+                first_blocks.append(source_line)
 
         def note_type(token: Optional[str]) -> None:
-            if debug is not None and token and token.strip().upper() in TRANSACTION_TYPE_CODES:
-                debug["type_matches_found"] += 1
+            if debug is None or not token:
+                return
+            if token.strip().upper() in TRANSACTION_TYPE_CODES:
+                debug["type_matches_found"] = debug.get("type_matches_found", 0) + 1
 
         def emit(transaction: Optional[Dict]) -> None:
             nonlocal row_index
