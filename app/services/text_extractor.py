@@ -2,6 +2,31 @@ from typing import Dict, List
 
 import pdfplumber
 
+try:  # PyMuPDF — a second, span-order text engine
+    import fitz
+except Exception:  # pragma: no cover - fitz is a hard dependency, but stay safe
+    fitz = None
+
+
+def _extract_flow_text(pdf_path: str) -> List[str]:
+    """Per-page text in PyMuPDF's reading order.
+
+    PyMuPDF emits each text span as a unit and orders spans by block/line, so
+    overlapping multi-column runs stay intact. pdfplumber's ``extract_text()``
+    sorts individual characters by coordinate, which on some statement PDFs
+    interleaves overlapping runs ("CDolumn ate" instead of "Column"/"Date").
+    """
+    if fitz is None:
+        return []
+    pages: List[str] = []
+    try:
+        with fitz.open(pdf_path) as doc:
+            for page in doc:
+                pages.append(page.get_text("text") or "")
+    except Exception:
+        return []
+    return pages
+
 
 def _safe_extract_tables(page) -> List[List[List[str]]]:
     """Geometry-based table extraction.
@@ -62,21 +87,25 @@ def extract_pdf_text(pdf_path: str) -> Dict:
     page_details = []
     extracted_texts = []
 
+    flow_pages = _extract_flow_text(pdf_path)
+
     with pdfplumber.open(pdf_path) as pdf:
         page_count = len(pdf.pages)
 
         for index, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
             extracted_texts.append(text)
+            flow_text = flow_pages[index - 1] if index - 1 < len(flow_pages) else ""
 
             page_details.append(
                 {
                     "page_number": index,
                     "text": text,
                     "text_length": len(text),
-                    # Position-aware reconstructions, used by parsers when the
-                    # default text layer is garbled. The plain `text` field is
-                    # left untouched so header/summary parsing is unaffected.
+                    # Alternative extractions, used by parsers when the default
+                    # text layer is garbled. The plain `text` field is left
+                    # untouched so header/summary parsing is unaffected.
+                    "flow_text": flow_text,
                     "tables": _safe_extract_tables(page),
                     "position_text": _reconstruct_text_by_position(page),
                 }

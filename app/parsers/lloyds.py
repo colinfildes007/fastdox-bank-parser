@@ -230,6 +230,7 @@ class LloydsStatementParser(BaseStatementParser):
                     "first_5_date_matches": transaction_debug.get("first_5_date_matches", []),
                     "first_5_candidate_blocks": transaction_debug.get("first_5_candidate_blocks", []),
                     "transaction_section_sample": transaction_debug.get("transaction_section_sample", []),
+                    "flow_text_sample": transaction_debug.get("flow_text_sample", []),
                     "first_transaction": first_transaction,
                     "last_transaction": last_transaction,
                     "transaction_rows": sum(page_stat.get("transaction_rows", 0) for page_stat in page_stats),
@@ -373,6 +374,7 @@ class LloydsStatementParser(BaseStatementParser):
         page_stats: List[Dict] = []
 
         doc_text = "\n".join(page.get("text", "") for page in pages)
+        doc_flow_text = "\n".join(page.get("flow_text", "") or "" for page in pages)
         debug: Dict = {
             "transaction_parser_called": False,
             "your_transactions_sections_found": len(
@@ -383,30 +385,30 @@ class LloydsStatementParser(BaseStatementParser):
             "candidate_transaction_blocks": 0,
             "first_5_date_matches": [],
             "first_5_candidate_blocks": [],
-            # Raw lines the parser actually iterates after the first "Your
-            # Transactions" banner. Surfaced so the exact extracted-text shape
-            # can be inspected when no rows match.
+            # Raw lines after the first "Your Transactions" banner, from both
+            # the default (coordinate-sorted) text layer and the PyMuPDF
+            # reading-order extraction — surfaced so the exact text shape can
+            # be inspected and the two extractions compared.
             "transaction_section_sample": self._sample_transaction_lines(doc_text),
+            "flow_text_sample": self._sample_transaction_lines(doc_flow_text),
         }
 
         # Document-level routing: a statement carrying Money In / Money Out
         # columns is a Lloyds-family labelled/flat table on every page — even
         # continuation pages that omit the repeated column header.
-        lower_doc = doc_text.lower()
+        lower_doc = (doc_text + "\n" + doc_flow_text).lower()
         money_column_layout = "money in" in lower_doc and "money out" in lower_doc
         debug["tables_detected"] = sum(len(page.get("tables", []) or []) for page in pages)
         debug["table_extraction_used"] = False
 
         for page in pages:
-            page_text = page.get("text", "")
-            position_text = page.get("position_text", "") or ""
+            page_text = page.get("text", "") or ""
             page_number = page.get("page_number")
             page_credit = 0.0
             page_debit = 0.0
             page_transactions: List[Dict] = []
 
-            # Strategy 1: geometry-based table extraction. Robust when the text
-            # layer is garbled (characters interleaved across columns).
+            # Strategy 1: geometry-based table extraction.
             page_transactions = self._parse_table_rows(
                 page.get("tables", []) or [],
                 page_number,
@@ -417,41 +419,50 @@ class LloydsStatementParser(BaseStatementParser):
                 debug["transaction_parser_called"] = True
                 debug["table_extraction_used"] = True
                 self._note_table_debug(debug, page_transactions)
-            elif money_column_layout or self._page_contains_labeled_transactions(page_text):
-                debug["transaction_parser_called"] = True
-                page_transactions = self._parse_labeled_transactions(
+            else:
+                # Strategy 2: labelled / stream parsing. Try each text source in
+                # order of reliability. The PyMuPDF reading-order extraction is
+                # immune to the character interleaving that corrupts the
+                # default coordinate-sorted text layer.
+                for source in (
+                    page.get("flow_text", "") or "",
                     page_text,
-                    page_number,
-                    statement_start_date,
-                    statement_end_date,
-                    debug,
-                )
-                # Strategy 2b: retry on position-reconstructed text when the
-                # default text layer produced nothing.
-                if not page_transactions and position_text and position_text != page_text:
+                    page.get("position_text", "") or "",
+                ):
+                    if not source.strip():
+                        continue
+                    if not (money_column_layout or self._page_contains_labeled_transactions(source)):
+                        continue
+                    debug["transaction_parser_called"] = True
                     page_transactions = self._parse_labeled_transactions(
-                        position_text,
+                        source,
                         page_number,
                         statement_start_date,
                         statement_end_date,
                         debug,
                     )
-            else:
-                page_order = self._detect_amount_column_order(page_text)
-                blocks = self._build_transaction_blocks([page])
-                debug["candidate_transaction_blocks"] += len(blocks)
-                for _, block in blocks:
-                    transaction = self._parse_transaction_block(
-                        block,
-                        page_number,
-                        statement_start_date,
-                        statement_end_date,
-                        amount_order=page_order,
-                    )
-                    if transaction:
-                        page_transactions.append(transaction)
-                    else:
-                        issues.append("transaction_parse_failed")
+                    if page_transactions:
+                        break
+
+                # Strategy 3: Debit/Credit "block" statements (no Money columns).
+                if not page_transactions and not (
+                    money_column_layout or self._page_contains_labeled_transactions(page_text)
+                ):
+                    page_order = self._detect_amount_column_order(page_text)
+                    blocks = self._build_transaction_blocks([page])
+                    debug["candidate_transaction_blocks"] += len(blocks)
+                    for _, block in blocks:
+                        transaction = self._parse_transaction_block(
+                            block,
+                            page_number,
+                            statement_start_date,
+                            statement_end_date,
+                            amount_order=page_order,
+                        )
+                        if transaction:
+                            page_transactions.append(transaction)
+                        else:
+                            issues.append("transaction_parse_failed")
 
             for transaction in page_transactions:
                 parsed.append(transaction)
