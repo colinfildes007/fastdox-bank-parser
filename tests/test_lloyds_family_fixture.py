@@ -158,6 +158,77 @@ def build_lloyds_blank_format_pdf():
     return doc.write()
 
 
+def build_lloyds_flat_table_pdf():
+    """A Lloyds 'Classic' statement whose 3-page transaction table is rendered
+    as flat single-line rows: '<date> <description> <type> <in> <out> <balance>'
+    with the literal token 'blank' in empty money cells. 48 transactions."""
+    import fitz
+
+    def money(value):
+        return f"{value:,.2f}"
+
+    credit_amounts = [3000.00] + [150.00] * 22 + [237.00]   # 24 rows -> 6537.00
+    debit_amounts = [1200.00] + [220.00] * 22 + [397.60]    # 24 rows -> 6437.60
+    credit_types = ["FPI", "BGC", "DEP", "PAY"]
+    debit_types = ["DD", "DEB", "FPO", "SO", "CPT"]
+    credit_names = ["HTEC SOLUTIO LTD", "AIDAN SHERWOOD", "ROCHDALE MBC", "BACS CREDIT"]
+    debit_names = ["THREE MOBILE", "WILLIAMHILL*INTERN", "TESCO STORES", "BRITISH GAS", "NETFLIX COM"]
+
+    rows = []
+    balance = 173.00
+    for i in range(24):
+        credit = credit_amounts[i]
+        balance = round(balance + credit, 2)
+        day = 1 + (len(rows) % 28)
+        rows.append(
+            f"{day:02d} Jan 26 {credit_names[i % len(credit_names)]} "
+            f"{credit_types[i % len(credit_types)]} {money(credit)} blank {money(balance)}"
+        )
+        debit = debit_amounts[i]
+        balance = round(balance - debit, 2)
+        day = 1 + (len(rows) % 28)
+        rows.append(
+            f"{day:02d} Jan 26 {debit_names[i % len(debit_names)]} "
+            f"{debit_types[i % len(debit_types)]} blank {money(debit)} {money(balance)}"
+        )
+
+    column_header = "Date Description Type Money In (£) Money Out (£) Balance (£)"
+    header_lines = [
+        "Lloyds Bank plc",
+        "Classic statement",
+        "Account name John Smith",
+        "Sort code 30-00-00",
+        "Account number 12345678",
+        "Statement period 01 Jan 26 to 31 Jan 26",
+        "Money In £6,537.00",
+        "Money Out £6,437.60",
+        "Balance on 01 January 2026 £173.00",
+        "Balance on 31 January 2026 £272.40",
+        "Your Transactions",
+        column_header,
+    ]
+    page_1 = "\n".join(header_lines + rows[0:16])
+    page_2 = "\n".join([column_header] + rows[16:32])
+    page_3 = "\n".join(
+        [column_header]
+        + rows[32:48]
+        + [
+            "Transaction types",
+            "DD Direct Debit",
+            "FPI Faster Payment In",
+            "FPO Faster Payment Out",
+            "DEB Debit card payment",
+            "SO Standing Order",
+        ]
+    )
+
+    doc = fitz.open()
+    for page_text in (page_1, page_2, page_3):
+        page = doc.new_page()
+        page.insert_text((54, 54), page_text, fontsize=8)
+    return doc.write()
+
+
 class LloydsFamilyFixtureTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
@@ -348,6 +419,83 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
         for tx in body["transactions"]:
             self.assertIn(tx["page_number"], (1, 2, 3))
             self.assertGreaterEqual(tx["row_index"], 1)
+
+    def test_lloyds_flat_row_example_rows_parse(self):
+        from app.parsers.lloyds import LloydsStatementParser
+
+        parser = LloydsStatementParser()
+        cases = [
+            ("02 Jan 26 ROCHDALE MBC DD blank 164.00 9.00",
+             "2026-01-02", "ROCHDALE MBC", "DD", 0.0, 164.00, 9.00),
+            ("02 Jan 26 AIDAN SHERWOOD FPI 295.00 blank 304.00",
+             "2026-01-02", "AIDAN SHERWOOD", "FPI", 295.00, 0.0, 304.00),
+            ("12 Jan 26 HTEC SOLUTIO LTD FPI 3,000.00 blank 3,009.00",
+             "2026-01-12", "HTEC SOLUTIO LTD", "FPI", 3000.00, 0.0, 3009.00),
+            ("29 Jan 26 WILLIAMHILL*INTERN DEB blank 50.00 383.00",
+             "2026-01-29", "WILLIAMHILL*INTERN", "DEB", 0.0, 50.00, 383.00),
+            ("30 Jan 26 THREE MOBILE FPO blank 32.60 297.40",
+             "2026-01-30", "THREE MOBILE", "FPO", 0.0, 32.60, 297.40),
+        ]
+        for line, date, desc, ttype, paid_in, paid_out, balance in cases:
+            tx = parser._parse_flat_transaction_row(line, 1, None, None)
+            self.assertIsNotNone(tx, f"row not parsed: {line}")
+            self.assertEqual(tx["transaction_date"], date)
+            self.assertEqual(tx["description_raw"], desc)
+            self.assertEqual(tx["transaction_type"], ttype)
+            self.assertEqual(tx["paid_in"], paid_in)
+            self.assertEqual(tx["paid_out"], paid_out)
+            self.assertEqual(tx["balance_after"], balance)
+
+    def test_lloyds_flat_table_extraction_reconciles(self):
+        pdf_bytes = build_lloyds_flat_table_pdf()
+        response = self._post_pdf(pdf_bytes)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+
+        self.assertEqual(body["status"], "success")
+        self.assertEqual(body["detected_bank"], "Lloyds Bank")
+        self.assertEqual(body["parser_adapter"], "lloyds_family_v1")
+        self.assertEqual(body["page_count"], 3)
+        self.assertEqual(body["transaction_count"], 48)
+
+        self.assertEqual(body["statement"]["opening_balance"], 173.0)
+        self.assertEqual(body["statement"]["closing_balance"], 272.4)
+        self.assertEqual(body["statement"]["total_credits"], 6537.0)
+        self.assertEqual(body["statement"]["total_debits"], 6437.6)
+
+        recon = body["reconciliation"]
+        self.assertEqual(recon["status"], "matched")
+        self.assertEqual(recon["calculated_total_credits"], 6537.0)
+        self.assertEqual(recon["calculated_total_debits"], 6437.6)
+
+        debug = body["parser_debug"]
+        self.assertEqual(debug["adapter_selected"], "lloyds_family_v1")
+        self.assertTrue(debug["header_parsed"])
+        self.assertTrue(debug["transaction_parser_called"])
+        self.assertEqual(debug["your_transactions_sections_found"], 1)
+        self.assertEqual(debug["date_matches_found"], 48)
+        self.assertEqual(debug["type_matches_found"], 48)
+        self.assertEqual(debug["candidate_transaction_blocks"], 48)
+        self.assertEqual(debug["transactions_returned"], 48)
+        self.assertEqual(debug["per_page_transaction_counts"], {"1": 16, "2": 16, "3": 16})
+        self.assertEqual(len(debug["first_5_date_matches"]), 5)
+        self.assertEqual(len(debug["first_5_candidate_blocks"]), 5)
+        self.assertIsNotNone(debug["first_transaction"])
+        self.assertIsNotNone(debug["last_transaction"])
+
+        first = body["transactions"][0]
+        self.assertEqual(first["description_raw"], "HTEC SOLUTIO LTD")
+        self.assertEqual(first["transaction_type"], "FPI")
+        self.assertEqual(first["paid_in"], 3000.0)
+        self.assertEqual(first["paid_out"], 0.0)
+        self.assertEqual(first["type"], "credit")
+        self.assertEqual(first["page_number"], 1)
+        self.assertEqual(first["row_index"], 1)
+
+        second = body["transactions"][1]
+        self.assertEqual(second["transaction_type"], "DD")
+        self.assertEqual(second["paid_out"], 1200.0)
+        self.assertEqual(second["type"], "debit")
 
     def test_health_includes_available_adapters(self):
         response = self.client.get("/health")
