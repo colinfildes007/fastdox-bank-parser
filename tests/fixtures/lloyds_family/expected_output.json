@@ -1,14 +1,14 @@
 {
   "detected_bank": "Lloyds Bank",
-  "bank_detection_confidence": 0.90,
+  "minimum_detection_confidence": 0.90,
   "parser_adapter": "lloyds_family_v1",
   "page_count": 1,
   "statement_start_date": "2025-01-01",
   "statement_end_date": "2025-01-08",
   "opening_balance": 1000.0,
-  "closing_balance": 1836.8,
-  "total_credits": 1235.8,
-  "total_debits": 399.0,
+  "closing_balance": 2176.0,
+  "total_credits": 1385.0,
+  "total_debits": 209.0,
   "transaction_count": 8,
   "reconciliation_status": "matched",
   "transactions": [
@@ -27,11 +27,46 @@
       "balance_after": 2196.8
     },
     {
-      "transaction_date": "2025-01-08",
+      "transaction_date": "2025-01-03",
+      "description_raw": "Groceries",
+      "amount": 45.8,
+      "type": "debit",
+      "balance_after": 2151.0
+    },
+    {
+      "transaction_date": "2025-01-04",
       "description_raw": "Refund",
       "amount": 25.0,
       "type": "credit",
-      "balance_after": 1836.8
+      "balance_after": 2176.0
+    },
+    {
+      "transaction_date": "2025-01-05",
+      "description_raw": "Bill payment",
+      "amount": 100.0,
+      "type": "debit",
+      "balance_after": 2076.0
+    },
+    {
+      "transaction_date": "2025-01-06",
+      "description_raw": "Transfer in",
+      "amount": 150.0,
+      "type": "credit",
+      "balance_after": 2226.0
+    },
+    {
+      "transaction_date": "2025-01-07",
+      "description_raw": "ATM withdrawal",
+      "amount": 60.0,
+      "type": "debit",
+      "balance_after": 2166.0
+    },
+    {
+      "transaction_date": "2025-01-08",
+      "description_raw": "Interest",
+      "amount": 10.0,
+      "type": "credit",
+      "balance_after": 2176.0
     }
   ]
 }

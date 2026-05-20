@@ -65,7 +65,7 @@ def build_santander_statement_pdf():
 class LloydsFamilyFixtureTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
-        self.fixture_path = Path("tests/fixtures/lloyds_family/sample_lloyds_statement.pdf")
+        self.fixture_path = Path("tests/fixtures/lloyds_family/sample_statement.pdf")
         self.expected = json.loads(
             Path("tests/fixtures/lloyds_family/expected_output.json").read_text()
         )
@@ -83,7 +83,7 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
         body = response.json()
 
         self.assertIn(body["detected_bank"], ["Lloyds Bank", "Halifax", "Bank of Scotland"])
-        self.assertGreaterEqual(body["bank_detection_confidence"], self.expected["bank_detection_confidence"])
+        self.assertGreaterEqual(body["bank_detection_confidence"], self.expected["minimum_detection_confidence"])
         self.assertEqual(body["parser_adapter"], self.expected["parser_adapter"])
         self.assertEqual(body["page_count"], self.expected["page_count"])
 
@@ -93,6 +93,7 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
         body = response.json()
 
         self.assertEqual(body["transaction_count"], self.expected["transaction_count"])
+        self.assertEqual(body["statement"]["opening_balance"], self.expected["opening_balance"])
         self.assertEqual(body["statement"]["closing_balance"], self.expected["closing_balance"])
         self.assertEqual(body["statement"]["total_credits"], self.expected["total_credits"])
         self.assertEqual(body["statement"]["total_debits"], self.expected["total_debits"])
