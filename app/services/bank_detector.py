@@ -44,7 +44,7 @@ BANK_SIGNATURES = {
     "Santander": ["santander uk plc", "santander"],
     "Lloyds Bank": ["lloyds bank", "lloyds"],
     "Halifax": ["halifax"],
-    "Bank of Scotland": ["bank of scotland", "bos"],
+    "Bank of Scotland": ["bank of scotland"],
 }
 
 BANK_HEADER_TAGS = [
@@ -84,6 +84,12 @@ def detect_bank(pages: Sequence[Dict[str, Any]], bank_hint: Optional[str] = None
 
     for bank_name, signatures in BANK_SIGNATURES.items():
         bank_name_found = any(signature in search_text for signature in signatures)
+        if bank_name == "Bank of Scotland":
+            bos_weak = "bos" in search_text
+            bank_name_found = bank_name_found or (
+                bos_weak and (has_table_headers or has_account_labels or has_statement_period)
+            )
+
         if not bank_name_found:
             continue
 

@@ -1,8 +1,9 @@
 import re
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from app.parsers.base import BaseStatementParser
-from app.services.reconciliation import extract_statement_totals
+from app.services.reconciliation import extract_statement_totals, reconcile
 
 DATE_PATTERN = re.compile(
     r"\b(\d{1,2}(?:/\d{1,2}(?:/\d{2,4})?|\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{2,4}))\b",
@@ -63,12 +64,15 @@ class LloydsStatementParser(BaseStatementParser):
         page_count = context.get("page_count", 0)
         detected_bank = context.get("detected_bank") or self.bank_name
 
-        transactions, issues = self._parse_transactions(pages)
-        totals = extract_statement_totals(all_text)
         statement_info = self._extract_statement_info(all_text)
-
         statement_start_date = statement_info["statement_start_date"]
         statement_end_date = statement_info["statement_end_date"]
+
+        transactions, issues = self._parse_transactions(
+            pages,
+            statement_start_date=statement_start_date,
+            statement_end_date=statement_end_date,
+        )
 
         if not statement_start_date or not statement_end_date:
             dates = [tx.get("transaction_date") for tx in transactions if tx.get("transaction_date")]
@@ -76,44 +80,36 @@ class LloydsStatementParser(BaseStatementParser):
                 statement_start_date = statement_start_date or min(dates)
                 statement_end_date = statement_end_date or max(dates)
 
+        totals = extract_statement_totals(all_text)
         opening_balance = totals.get("derived_opening_balance")
         if opening_balance is None:
             opening_balance = self._estimate_opening_balance(transactions)
+
+        statement = {
+            "bank_name": detected_bank,
+            "account_holder": statement_info["account_holder"],
+            "account_number": statement_info["account_number"],
+            "sort_code": statement_info["sort_code"],
+            "statement_start_date": statement_start_date,
+            "statement_end_date": statement_end_date,
+            "opening_balance": opening_balance,
+            "closing_balance": totals.get("closing_balance"),
+            "total_credits": totals.get("total_credits"),
+            "total_debits": totals.get("total_debits"),
+            "derived_opening_balance": totals.get("derived_opening_balance"),
+            "currency": "GBP",
+        }
+        reconciliation_result = reconcile(statement, transactions)
 
         response = self.build_response(context)
         response.update(
             {
                 "bank_name": detected_bank,
-                "statement": {
-                    "bank_name": detected_bank,
-                    "account_holder": statement_info["account_holder"],
-                    "account_number": statement_info["account_number"],
-                    "sort_code": statement_info["sort_code"],
-                    "statement_start_date": statement_start_date,
-                    "statement_end_date": statement_end_date,
-                    "opening_balance": opening_balance,
-                    "closing_balance": totals.get("closing_balance"),
-                    "total_credits": totals.get("total_credits"),
-                    "total_debits": totals.get("total_debits"),
-                    "currency": "GBP",
-                },
+                "statement": statement,
                 "accounts": [],
                 "transactions": transactions,
                 "issues": issues,
-                "reconciliation": {
-                    "status": "totals_detected"
-                    if totals["total_debits"] is not None
-                    and totals["total_credits"] is not None
-                    and totals["closing_balance"] is not None
-                    else "missing_totals",
-                    "calculated_total_debits": None,
-                    "calculated_total_credits": None,
-                    "statement_total_debits": totals.get("total_debits"),
-                    "statement_total_credits": totals.get("total_credits"),
-                    "closing_balance": totals.get("closing_balance"),
-                    "derived_opening_balance": totals.get("derived_opening_balance"),
-                    "difference": None,
-                },
+                "reconciliation": reconciliation_result,
                 "parser_debug": {
                     "parser_name": self.parser_name,
                     "page_count": page_count,
@@ -133,8 +129,10 @@ class LloydsStatementParser(BaseStatementParser):
         return response
 
     def _extract_statement_info(self, text: str) -> Dict[str, Optional[str]]:
-        lower_text = text.lower()
-        account_holder = self._find_label_value(text, ["account holder", "account name", "name"])
+        account_holder = self._find_label_value(text, ["account holder", "account name"])
+        if not account_holder:
+            account_holder = self._find_label_value(text, ["name"])
+
         account_number = self._find_label_value(text, ["account number"], allow_masked=True)
         sort_code = self._find_label_value(text, ["sort code"], allow_masked=True)
         statement_start_date, statement_end_date = self._extract_statement_period(text)
@@ -149,10 +147,16 @@ class LloydsStatementParser(BaseStatementParser):
 
     def _find_label_value(self, text: str, labels: List[str], allow_masked: bool = False) -> Optional[str]:
         for label in labels:
-            pattern = re.compile(
-                rf"{re.escape(label)}\s*[:\-]?\s*([\d\*\s\-]+|[A-Za-z0-9 \&\,\.'/-]+)",
-                re.IGNORECASE,
-            )
+            if label == "name":
+                pattern = re.compile(
+                    rf"\b(?:account\s+)?name\b\s*[:\-]?\s*([\d\*\s\-]+|[A-Za-z0-9 \&\,\.'/-]+)",
+                    re.IGNORECASE,
+                )
+            else:
+                pattern = re.compile(
+                    rf"\b{re.escape(label)}\b\s*[:\-]?\s*([\d\*\s\-]+|[A-Za-z0-9 \&\,\.'/-]+)",
+                    re.IGNORECASE,
+                )
             match = pattern.search(text)
             if match:
                 value = match.group(1).strip()
@@ -163,21 +167,33 @@ class LloydsStatementParser(BaseStatementParser):
 
     def _extract_statement_period(self, text: str) -> Tuple[Optional[str], Optional[str]]:
         period_match = re.search(
-            r"statement period\s*[:\-]?\s*(\d{1,2}(?:\s+\w+\s+\d{2,4}|/\d{1,2}/\d{2,4}))\s*(?:to|-)\s*(\d{1,2}(?:\s+\w+\s+\d{2,4}|/\d{1,2}/\d{2,4}))",
+            r"statement period\s*[:\-]?\s*(\d{1,2}(?:\s+\w+\s+\d{2,4}|/\d{1,2}(?:/\d{2,4})?))\s*(?:to|-)\s*(\d{1,2}(?:\s+\w+\s+\d{2,4}|/\d{1,2}(?:/\d{2,4})?))",
             text,
             re.IGNORECASE,
         )
         if period_match:
-            return self._parse_date(period_match.group(1)), self._parse_date(period_match.group(2))
+            start_date = self._parse_date(period_match.group(1))
+            end_date = self._parse_date(period_match.group(2), statement_start_date=start_date)
+            return start_date, end_date
         return None, None
 
-    def _parse_transactions(self, pages: List[Dict]) -> (List[Dict], List[str]):
+    def _parse_transactions(
+        self,
+        pages: List[Dict],
+        statement_start_date: Optional[str],
+        statement_end_date: Optional[str],
+    ) -> (List[Dict], List[str]):
         blocks = self._build_transaction_blocks(pages)
         parsed = []
         issues = []
 
         for page_number, block in blocks:
-            transaction = self._parse_transaction_block(block, page_number)
+            transaction = self._parse_transaction_block(
+                block,
+                page_number,
+                statement_start_date,
+                statement_end_date,
+            )
             if transaction:
                 parsed.append(transaction)
             else:
@@ -226,13 +242,23 @@ class LloydsStatementParser(BaseStatementParser):
         lower_line = line.lower()
         return any(token in lower_line for token in FOOTER_PATTERNS)
 
-    def _parse_transaction_block(self, block: List[str], page_number: Optional[int]) -> Optional[Dict]:
+    def _parse_transaction_block(
+        self,
+        block: List[str],
+        page_number: Optional[int],
+        statement_start_date: Optional[str],
+        statement_end_date: Optional[str],
+    ) -> Optional[Dict]:
         first_line = block[0]
         data_match = DATE_PATTERN.search(first_line)
         if not data_match:
             return None
 
-        transaction_date = self._parse_date(data_match.group(1))
+        transaction_date = self._parse_date(
+            data_match.group(1),
+            statement_start_date=statement_start_date,
+            statement_end_date=statement_end_date,
+        )
         raw_text = " ".join(block)
         money_values = [self._parse_money(value) for value in MONEY_PATTERN.findall(raw_text)]
 
@@ -280,28 +306,71 @@ class LloydsStatementParser(BaseStatementParser):
     def _parse_money(self, value: str) -> float:
         return round(float(value.replace("£", "").replace(",", "")), 2)
 
-    def _parse_date(self, raw_date: str) -> str:
+    def _parse_date(
+        self,
+        raw_date: str,
+        statement_start_date: Optional[str] = None,
+        statement_end_date: Optional[str] = None,
+    ) -> str:
         raw_date = raw_date.strip()
         if "/" in raw_date:
             parts = raw_date.split("/")
             if len(parts) == 2:
                 day, month = parts
-                year = "20" + month[-2:]
+                day = day.zfill(2)
+                month = month.zfill(2)
+                year = self._infer_year_for_month(month, statement_start_date, statement_end_date)
             else:
                 day, month, year = parts
-            day = day.zfill(2)
-            month = month.zfill(2)
-            year = year if len(year) == 4 else f"20{year}"
+                day = day.zfill(2)
+                month = month.zfill(2)
+                year = year.strip()
+                year = year if len(year) == 4 else f"20{year}"
             return f"{year}-{month}-{day}"
 
-        match = re.search(r"(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2,4})", raw_date, re.IGNORECASE)
+        match = re.search(
+            r"(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2,4})",
+            raw_date,
+            re.IGNORECASE,
+        )
         if not match:
             return raw_date
 
-        day, month_token, year = match.groups()
+        day, month_token, year_token = match.groups()
         month = MONTH_MAP.get(month_token[:3].lower(), "01")
-        year = year if len(year) == 4 else f"20{year}"
+        year = year_token if len(year_token) == 4 else f"20{year_token}"
         return f"{year}-{month}-{int(day):02d}"
+
+    def _infer_year_for_month(
+        self,
+        month: str,
+        statement_start_date: Optional[str],
+        statement_end_date: Optional[str],
+    ) -> str:
+        if statement_start_date and statement_end_date:
+            try:
+                start_year = int(statement_start_date[:4])
+                start_month = int(statement_start_date[5:7])
+                end_year = int(statement_end_date[:4])
+                end_month = int(statement_end_date[5:7])
+                target_month = int(month)
+
+                if start_year == end_year:
+                    return str(start_year)
+
+                if target_month >= start_month:
+                    return str(start_year)
+                if target_month <= end_month:
+                    return str(end_year)
+            except ValueError:
+                pass
+
+        if statement_start_date:
+            return statement_start_date[:4]
+        if statement_end_date:
+            return statement_end_date[:4]
+
+        return str(datetime.now().year)
 
     def _assign_directions(self, transactions: List[Dict], issues: List[str]) -> List[Dict]:
         for index, transaction in enumerate(transactions):

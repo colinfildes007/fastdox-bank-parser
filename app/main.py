@@ -6,7 +6,7 @@ import shutil
 from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Form
 
 from app.models import ExtractRequest
-from app.services.bank_detector import detect_bank, select_parser
+from app.services.bank_detector import available_parsers, detect_bank, select_parser
 from app.services.pdf_loader import download_pdf
 from app.services.reconciliation import reconcile
 from app.services.text_extractor import extract_pdf_text
@@ -30,10 +30,17 @@ def require_auth(authorization: Optional[str]) -> None:
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
+    adapters = []
+    for parser in available_parsers():
+        adapter = getattr(parser, "parser_adapter", None)
+        if adapter and adapter not in adapters:
+            adapters.append(adapter)
+
     return {
         "status": "ok",
         "service": "fastdox-bank-parser",
         "parser_version": PARSER_VERSION,
+        "available_adapters": adapters,
     }
 
 

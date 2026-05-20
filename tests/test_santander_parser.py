@@ -57,7 +57,7 @@ class SantanderParserFinalPageTest(unittest.TestCase):
         self.assertNotIn("unknown_direction", result["issues"])
 
         reconciliation = reconcile(result["statement"], result["transactions"])
-        self.assertEqual(reconciliation["status"], "mismatch")
+        self.assertEqual(reconciliation["status"], "failed_reconciliation")
         self.assertEqual(reconciliation["calculated_total_debits"], 13.86)
         self.assertEqual(reconciliation["calculated_total_credits"], 0.0)
         self.assertEqual(reconciliation["statement_total_debits"], 8273.18)

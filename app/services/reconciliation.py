@@ -100,7 +100,7 @@ def reconcile(statement: Dict[str, Optional[float]], transactions: list) -> Dict
 
     debit_match = abs(calculated_total_debits - statement_total_debits) <= 0.01
     credit_match = abs(calculated_total_credits - statement_total_credits) <= 0.01
-    status = "matched" if debit_match and credit_match else "mismatch"
+    status = "matched" if debit_match and credit_match else "failed_reconciliation"
     difference = round(
         (calculated_total_debits - statement_total_debits)
         + (calculated_total_credits - statement_total_credits),

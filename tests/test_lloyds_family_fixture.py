@@ -113,6 +113,16 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
                 f"Expected transaction not found: {expected_tx}",
             )
 
+    def test_health_includes_available_adapters(self):
+        response = self.client.get("/health")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+
+        self.assertEqual(body["status"], "ok")
+        self.assertIsInstance(body.get("available_adapters"), list)
+        self.assertIn("santander_v1", body["available_adapters"])
+        self.assertIn("lloyds_family_v1", body["available_adapters"])
+
     def test_santander_regression_still_passes(self):
         pdf_bytes = build_santander_statement_pdf()
         response = self._post_pdf(pdf_bytes)
