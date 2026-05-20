@@ -84,6 +84,21 @@ TRANSACTION_TYPE_CODES = {
 # decimal places). Empty cells are handled separately as the token "blank".
 ROW_MONEY_TOKEN = re.compile(r"^£?\d[\d,]*\.\d{2}$")
 
+# Robust matcher for one transaction. Run against the transaction section after
+# *all* whitespace (newlines included) has been collapsed to single spaces, so
+# it is immune to how the text layer breaks lines — whether each field sits on
+# its own line or labels and values are merged ("DD Money In (£) blank.").
+# Empty money cells ("blank") or wholly absent money cells are both tolerated.
+TRANSACTION_STREAM_RE = re.compile(
+    r"Date\s+(?P<date>\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4})\.?\s+"
+    r"Description\s+(?P<desc>.+?)\.?\s+"
+    r"Type\s+(?P<type>[A-Za-z]{2,5})\.?"
+    r"\s+Money\s*In\s*(?:\(\s*£?\s*\))?\.?(?:\s+(?P<mi>blank\.?|£?[\d,]+\.\d{2}))?"
+    r"\s+Money\s*Out\s*(?:\(\s*£?\s*\))?\.?(?:\s+(?P<mo>blank\.?|£?[\d,]+\.\d{2}))?"
+    r"\s+Balance\s*(?:\(\s*£?\s*\))?\.?\s+(?P<bal>-?£?[\d,]+\.\d{2})",
+    re.IGNORECASE,
+)
+
 
 class LloydsStatementParser(BaseStatementParser):
     bank_name = "Lloyds"
@@ -450,6 +465,69 @@ class LloydsStatementParser(BaseStatementParser):
                 flat_rows += 1
         return label_lines >= 3 or flat_rows >= 1
 
+    def _parse_transaction_stream(
+        self,
+        page_text: str,
+        page_number: Optional[int],
+        statement_start_date: Optional[str],
+        statement_end_date: Optional[str],
+        debug: Optional[Dict] = None,
+    ) -> List[Dict]:
+        """Whitespace-agnostic parse of a labelled transaction table.
+
+        The transaction section is reduced to a single blob (every run of
+        whitespace, newlines included, collapsed to one space) and the
+        repeating Date / Description / Type / Money In / Money Out / Balance
+        template is matched directly. This works whether the text layer puts
+        each field on its own line, merges labels and values onto one line, or
+        appends a trailing full stop to every cell.
+        """
+        section = page_text
+        start = section.lower().find("your transactions")
+        if start != -1:
+            section = section[start + len("your transactions"):]
+        stop = section.lower().find("transaction types")
+        if stop != -1:
+            section = section[:stop]
+
+        blob = " ".join(section.split())
+        if not blob:
+            return []
+
+        transactions: List[Dict] = []
+        for match in TRANSACTION_STREAM_RE.finditer(blob):
+            block = self._new_labeled_block()
+            block["transaction_date"] = self._parse_date(
+                match.group("date"),
+                statement_start_date=statement_start_date,
+                statement_end_date=statement_end_date,
+            )
+            block["description_raw"] = self._clean_labeled_value(match.group("desc"))
+            block["transaction_type"] = self._clean_labeled_value(match.group("type"))
+            block["paid_in"] = self._parse_money(match.group("mi"))
+            block["paid_out"] = self._parse_money(match.group("mo"))
+            block["balance_after"] = self._parse_money_or_none(match.group("bal"))
+
+            transaction = self._build_transaction(block, page_number)
+            if transaction is None:
+                continue
+            transaction["row_index"] = len(transactions) + 1
+            transactions.append(transaction)
+
+            if debug is not None:
+                debug["date_matches_found"] = debug.get("date_matches_found", 0) + 1
+                debug["candidate_transaction_blocks"] = debug.get("candidate_transaction_blocks", 0) + 1
+                if (block["transaction_type"] or "").rstrip(".").upper() in TRANSACTION_TYPE_CODES:
+                    debug["type_matches_found"] = debug.get("type_matches_found", 0) + 1
+                first_dates = debug.setdefault("first_5_date_matches", [])
+                first_blocks = debug.setdefault("first_5_candidate_blocks", [])
+                if len(first_dates) < 5:
+                    first_dates.append(block["transaction_date"])
+                if len(first_blocks) < 5:
+                    first_blocks.append(match.group(0)[:160])
+
+        return transactions
+
     def _parse_labeled_transactions(
         self,
         page_text: str,
@@ -460,13 +538,21 @@ class LloydsStatementParser(BaseStatementParser):
     ) -> List[Dict]:
         """Extract transaction rows from a Lloyds-family transaction table.
 
-        Two text layouts are supported, possibly mixed:
+        Three text layouts are supported:
+          * stream -- the whole section as one whitespace-collapsed blob
+            (labels and values merged in any combination); tried first.
           * flat rows -- one line per transaction, e.g.
             ``02 Jan 26 ROCHDALE MBC DD blank 164.00 9.00``
-          * labelled blocks -- a run of ``label`` / ``value`` lines, where the
-            value may be inline ("Money In (£) blank.") or on the next line.
+          * labelled blocks -- a run of ``label`` / ``value`` lines.
         Empty money cells are rendered as the literal token "blank".
         """
+        # Primary path: whitespace-agnostic stream match.
+        stream = self._parse_transaction_stream(
+            page_text, page_number, statement_start_date, statement_end_date, debug
+        )
+        if stream:
+            return stream
+
         lines = [line.strip() for line in page_text.splitlines() if line.strip()]
 
         # Only parse rows that appear after the "Your Transactions" banner

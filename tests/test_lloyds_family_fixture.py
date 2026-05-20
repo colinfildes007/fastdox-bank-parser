@@ -360,6 +360,74 @@ def build_lloyds_real_classic_pdf():
     return doc.write()
 
 
+def build_lloyds_merged_blocks_pdf():
+    """Reproduction of the real statement's text layer: labelled blocks where
+    the empty money cell ("blank.") and its column label are merged onto the
+    preceding value line — e.g. "DD Money In (£) blank." after a "Type" line,
+    or "295.00 Money Out (£) blank." after a "Money In (£)" line."""
+    import fitz
+
+    def amount(value):
+        return f"{value:,.2f}"
+
+    column_block = [
+        "Your Transactions",
+        "Column", "Date", "Column", "Description", "Column", "Type",
+        "Column", "Money In (£)", "Column", "Money Out (£)", "Column", "Balance (£)",
+    ]
+
+    def tx_lines(date, desc, ttype, money_in, money_out, balance):
+        if money_in is None:
+            # Debit: empty Money In cell merges onto the Type value line.
+            return [
+                "Date", date, "Description", desc,
+                "Type", f"{ttype} Money In (£) blank.",
+                "Money Out (£)", amount(money_out),
+                "Balance (£)", amount(balance),
+            ]
+        # Credit: empty Money Out cell merges onto the Money In value line.
+        return [
+            "Date", date, "Description", desc, "Type", ttype,
+            "Money In (£)", f"{amount(money_in)} Money Out (£) blank.",
+            "Balance (£)", amount(balance),
+        ]
+
+    pages_lines = {
+        1: [
+            "Page 1 of 3", "Lloyds Bank plc", "Classic statement",
+            "Your Account", "Sort Code 77-19-26", "Account Number 41496768",
+            "Statement period 01 Jan 26 to 31 Jan 26",
+            "Money In £6,537.00", "Money Out £6,437.60",
+            "Balance on 01 January 2026 £173.00",
+            "Balance on 31 January 2026 £272.40",
+        ],
+        2: ["Page 2 of 3", "Lloyds Bank plc", "CLASSIC Sort Code 77-19-26", "Account Number 41496768"],
+        3: ["Page 3 of 3", "Lloyds Bank plc", "CLASSIC Sort Code 77-19-26", "Account Number 41496768"],
+    }
+    for page_number in (1, 2, 3):
+        pages_lines[page_number] += column_block
+    for (page_number, date, desc, ttype, money_in, money_out, balance) in LLOYDS_REAL_TRANSACTIONS:
+        pages_lines[page_number] += tx_lines(date, desc, ttype, money_in, money_out, balance)
+    pages_lines[1].append("(Continued on next page)")
+    pages_lines[2].append("(Continued on next page)")
+    pages_lines[3] += [
+        "Transaction types blank.",
+        "BGC Bank Giro Credit BP Bill Payments CHG Charge CHQ Cheque",
+        "DD Direct Debit DEB Debit Card FPI Faster Payment In FPO Faster Payment Out",
+        "SO Standing Order TFR Transfer",
+    ]
+
+    doc = fitz.open()
+    for page_number in (1, 2, 3):
+        lines = pages_lines[page_number]
+        page = doc.new_page(width=612, height=80 + len(lines) * 11 + 60)
+        y = 50
+        for line in lines:
+            page.insert_text((40, y), line, fontsize=8)
+            y += 11
+    return doc.write()
+
+
 class LloydsFamilyFixtureTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
@@ -686,6 +754,56 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
         self.assertIn("P.O. G9 MIDDLETON", by_desc)
         # a zero-balance row is still captured
         self.assertTrue(any(tx["balance_after"] == 0.0 for tx in body["transactions"]))
+
+    def test_lloyds_merged_blocks_extraction_reconciles(self):
+        pdf_bytes = build_lloyds_merged_blocks_pdf()
+        response = self._post_pdf(pdf_bytes)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+
+        self.assertEqual(body["status"], "success")
+        self.assertEqual(body["detected_bank"], "Lloyds Bank")
+        self.assertEqual(body["parser_adapter"], "lloyds_family_v1")
+        self.assertEqual(body["page_count"], 3)
+        self.assertEqual(body["transaction_count"], 55)
+
+        self.assertEqual(body["statement"]["opening_balance"], 173.0)
+        self.assertEqual(body["statement"]["closing_balance"], 272.4)
+        self.assertEqual(body["statement"]["total_credits"], 6537.0)
+        self.assertEqual(body["statement"]["total_debits"], 6437.6)
+
+        recon = body["reconciliation"]
+        self.assertEqual(recon["status"], "matched")
+        self.assertEqual(recon["calculated_total_credits"], 6537.0)
+        self.assertEqual(recon["calculated_total_debits"], 6437.6)
+
+        debug = body["parser_debug"]
+        self.assertTrue(debug["transaction_parser_called"])
+        self.assertEqual(debug["transactions_returned"], 55)
+        self.assertEqual(debug["date_matches_found"], 55)
+        self.assertEqual(debug["type_matches_found"], 55)
+        self.assertEqual(debug["per_page_transaction_counts"], {"1": 16, "2": 22, "3": 17})
+
+        by_desc = {}
+        for tx in body["transactions"]:
+            by_desc.setdefault(tx["description_raw"], []).append(tx)
+
+        # Debit row: "Type" line is "DD Money In (£) blank." in the text layer.
+        rochdale = by_desc["ROCHDALE MBC"][0]
+        self.assertEqual(rochdale["transaction_type"], "DD")
+        self.assertEqual(rochdale["paid_in"], 0.0)
+        self.assertEqual(rochdale["paid_out"], 164.0)
+        self.assertEqual(rochdale["balance_after"], 9.0)
+
+        # Credit row: money-in value line is "295.00 Money Out (£) blank.".
+        aidan = by_desc["AIDAN SHERWOOD"][0]
+        self.assertEqual(aidan["transaction_type"], "FPI")
+        self.assertEqual(aidan["paid_in"], 295.0)
+        self.assertEqual(aidan["paid_out"], 0.0)
+        self.assertEqual(aidan["balance_after"], 304.0)
+
+        htec = by_desc["HTEC SOLUTIO LTD"][0]
+        self.assertEqual(htec["paid_in"], 3000.0)
 
     def test_health_includes_available_adapters(self):
         response = self.client.get("/health")
