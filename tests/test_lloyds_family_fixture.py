@@ -1008,76 +1008,30 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
         ]
         self.assertEqual(len(identities), len(set(identities)))
 
-    def test_lloyds_phase1_acceptance_regression(self):
-        """Frozen Phase 1 acceptance result for the real Lloyds 'Classic'
-        Statement_2026_lloyds.pdf (55-transaction statement).
+    def _assert_protected_parser_fixture(self, body, *, detected_bank, parser_adapter, transaction_count):
+        """Shared assertions for a protected parser fixture (Santander, Lloyds).
 
-        This guards the Lloyds parser: it fails if transaction_count drifts,
-        the calculated totals stop matching the statement totals, reconciliation
-        is not "matched", a duplicate is reported, the wrong adapter is used, or
-        transactions[] comes back empty.
+        Returns the reconciliation block for any fixture-specific follow-up
+        checks.
         """
-        expected = json.loads(
-            Path("tests/fixtures/lloyds_family/expected_output_lloyds_acceptance.json").read_text()
-        )
-
-        pdf_bytes = build_lloyds_merged_blocks_pdf()
-        response = self._post_pdf(pdf_bytes)
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
-
-        # --- parser identity ---
+        # correct bank detection and adapter selection
         self.assertEqual(body["status"], "success")
-        self.assertEqual(body["detected_bank"], expected["detected_bank"])
-        self.assertEqual(body["parser_adapter"], expected["parser_adapter"])
-        self.assertEqual(body["parser_debug"]["adapter_selected"], "lloyds_family_v1")
-        self.assertEqual(body["parser_debug"]["parser_adapter"], "lloyds_family_v1")
-        self.assertTrue(body["parser_debug"]["transaction_parser_called"])
+        self.assertEqual(body["detected_bank"], detected_bank)
+        self.assertEqual(body["parser_adapter"], parser_adapter)
 
-        # --- transaction count is frozen, and transactions[] is populated ---
-        self.assertEqual(body["transaction_count"], expected["transaction_count"])
-        self.assertEqual(len(body["transactions"]), expected["transaction_count"])
-        self.assertGreater(len(body["transactions"]), 0)
+        # non-empty transactions[], frozen transaction count
+        transactions = body["transactions"]
+        self.assertGreater(len(transactions), 0, f"{parser_adapter}: transactions[] is empty")
+        self.assertEqual(body["transaction_count"], transaction_count)
+        self.assertEqual(len(transactions), transaction_count)
 
-        # --- statement header ---
-        self.assertEqual(body["statement"]["opening_balance"], expected["opening_balance"])
-        self.assertEqual(body["statement"]["closing_balance"], expected["closing_balance"])
-        self.assertEqual(body["statement"]["total_credits"], expected["statement_total_credits"])
-        self.assertEqual(body["statement"]["total_debits"], expected["statement_total_debits"])
-
-        # --- reconciliation: calculated totals must match the statement totals ---
-        recon = body["reconciliation"]
-        self.assertEqual(recon["status"], expected["reconciliation_status"])
-        self.assertEqual(recon["calculated_total_credits"], expected["calculated_total_credits"])
-        self.assertEqual(recon["calculated_total_debits"], expected["calculated_total_debits"])
-        self.assertEqual(recon["calculated_total_credits"], recon["statement_total_credits"])
-        self.assertEqual(recon["calculated_total_debits"], recon["statement_total_debits"])
-
-        # opening + credits - debits == closing
-        self.assertAlmostEqual(
-            round(
-                expected["opening_balance"]
-                + expected["calculated_total_credits"]
-                - expected["calculated_total_debits"],
-                2,
-            ),
-            expected["closing_balance"],
-            places=2,
-        )
-
-        # --- duplicates ---
-        self.assertEqual(
-            body["parser_debug"]["duplicate_transaction_count"],
-            expected["duplicate_transaction_count"],
-        )
-
-        # --- every transaction carries the required fields ---
-        for tx in body["transactions"]:
+        # every row carries the core fields
+        for tx in transactions:
             for field in ("transaction_date", "description_raw", "paid_in", "paid_out", "balance_after"):
                 self.assertIn(field, tx)
-                self.assertIsNotNone(tx[field], f"{field} missing on transaction {tx}")
+                self.assertIsNotNone(tx[field], f"{parser_adapter}: {field} missing on {tx}")
 
-        # --- no two transactions share a full identity key ---
+        # no two transactions share a full identity key
         identities = [
             (
                 tx["transaction_date"],
@@ -1087,20 +1041,96 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
                 round(float(tx["paid_out"]), 2),
                 round(float(tx["balance_after"]), 2),
             )
-            for tx in body["transactions"]
+            for tx in transactions
         ]
         self.assertEqual(
-            len(identities), len(set(identities)), "duplicate transaction identity key found"
+            len(identities), len(set(identities)),
+            f"{parser_adapter}: duplicate transaction identity key",
         )
 
-        # --- the calculated totals are exactly the sum of the rows ---
+        # reconciliation: matched, and calculated totals == statement totals
+        recon = body["reconciliation"]
+        self.assertEqual(recon["status"], "matched")
+        self.assertEqual(recon["calculated_total_credits"], recon["statement_total_credits"])
+        self.assertEqual(recon["calculated_total_debits"], recon["statement_total_debits"])
+
+        # calculated totals are exactly the sum of the rows
         self.assertEqual(
-            round(sum(float(tx["paid_in"]) for tx in body["transactions"]), 2),
-            expected["calculated_total_credits"],
+            round(sum(float(tx["paid_in"]) for tx in transactions), 2),
+            recon["calculated_total_credits"],
         )
         self.assertEqual(
-            round(sum(float(tx["paid_out"]) for tx in body["transactions"]), 2),
-            expected["calculated_total_debits"],
+            round(sum(float(tx["paid_out"]) for tx in transactions), 2),
+            recon["calculated_total_debits"],
+        )
+
+        # opening + credits - debits == closing
+        opening = recon.get("opening_balance")
+        if opening is None:
+            opening = recon.get("derived_opening_balance")
+        self.assertIsNotNone(opening, f"{parser_adapter}: no opening balance available")
+        self.assertAlmostEqual(
+            round(opening + recon["calculated_total_credits"] - recon["calculated_total_debits"], 2),
+            round(recon["closing_balance"], 2),
+            places=2,
+        )
+        return recon
+
+    def test_protected_fixture_santander(self):
+        """Protected Santander fixture — guards the santander_v1 adapter."""
+        response = self._post_pdf(build_santander_statement_pdf())
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+
+        recon = self._assert_protected_parser_fixture(
+            body,
+            detected_bank="Santander",
+            parser_adapter="santander_v1",
+            transaction_count=256,
+        )
+        self.assertEqual(recon["calculated_total_credits"], 8092.75)
+        self.assertEqual(recon["calculated_total_debits"], 8273.18)
+        self.assertEqual(recon["closing_balance"], 98.10)
+
+    def test_lloyds_phase1_acceptance_regression(self):
+        """Frozen Phase 1 acceptance result for the real Lloyds 'Classic'
+        Statement_2026_lloyds.pdf (55-transaction statement) — the protected
+        Lloyds fixture.
+
+        Fails if transaction_count drifts, the calculated totals stop matching
+        the statement totals, reconciliation is not "matched", a duplicate is
+        reported, the wrong adapter is used, or transactions[] is empty.
+        """
+        expected = json.loads(
+            Path("tests/fixtures/lloyds_family/expected_output_lloyds_acceptance.json").read_text()
+        )
+
+        response = self._post_pdf(build_lloyds_merged_blocks_pdf())
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+
+        recon = self._assert_protected_parser_fixture(
+            body,
+            detected_bank=expected["detected_bank"],
+            parser_adapter=expected["parser_adapter"],
+            transaction_count=expected["transaction_count"],
+        )
+
+        # frozen statement header / total values
+        self.assertEqual(body["statement"]["opening_balance"], expected["opening_balance"])
+        self.assertEqual(body["statement"]["closing_balance"], expected["closing_balance"])
+        self.assertEqual(body["statement"]["total_credits"], expected["statement_total_credits"])
+        self.assertEqual(body["statement"]["total_debits"], expected["statement_total_debits"])
+        self.assertEqual(recon["calculated_total_credits"], expected["calculated_total_credits"])
+        self.assertEqual(recon["calculated_total_debits"], expected["calculated_total_debits"])
+
+        # adapter confirmation + duplicate diagnostics
+        self.assertEqual(body["parser_debug"]["adapter_selected"], "lloyds_family_v1")
+        self.assertEqual(body["parser_debug"]["parser_adapter"], "lloyds_family_v1")
+        self.assertTrue(body["parser_debug"]["transaction_parser_called"])
+        self.assertEqual(
+            body["parser_debug"]["duplicate_transaction_count"],
+            expected["duplicate_transaction_count"],
         )
 
     def test_health_includes_available_adapters(self):
