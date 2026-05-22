@@ -1133,6 +1133,71 @@ class LloydsFamilyFixtureTests(unittest.TestCase):
             expected["duplicate_transaction_count"],
         )
 
+    def test_lloyds_post_import_pipeline_contract(self):
+        """Post-import pipeline regression note for the Lloyds fixture.
+
+        The summary, categorisation and risk LOGIC lives in Base44, not in this
+        parser repo. This test locks the PARSER OUTPUT the pipeline consumes so
+        a future parser change cannot feed the pipeline the inputs that caused
+        the Phase 2 bug (total_income = 0, total_spending = 99.40, and a false
+        Negative Net Cashflow flag).
+
+        Pipeline mapping:
+            total_income   <- statement.total_credits
+            total_spending <- statement.total_debits
+            net_movement   =  total_credits - total_debits
+
+        Risk expectations the parser output must support:
+            * Negative Net Cashflow must NOT fire — net_movement is +99.40.
+            * Gambling Transactions may fire — 5 rows totalling 360.00.
+            * High Discretionary Spend is computed against total_spending
+              (6437.60), never the net movement.
+            * Review concentration is a Base44 concern (AI categories) and is
+              not asserted here.
+        """
+        expected = json.loads(
+            Path("tests/fixtures/lloyds_family/expected_pipeline_lloyds.json").read_text()
+        )
+
+        response = self._post_pdf(build_lloyds_merged_blocks_pdf())
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+
+        statement = body["statement"]
+        total_income = statement["total_credits"]
+        total_spending = statement["total_debits"]
+        net_movement = round(total_income - total_spending, 2)
+
+        # --- summary values the pipeline derives from the parser output ---
+        self.assertEqual(total_income, expected["total_income"])
+        self.assertEqual(total_spending, expected["total_spending"])
+        self.assertEqual(net_movement, expected["net_movement"])
+        self.assertEqual(statement["opening_balance"], expected["opening_balance"])
+        self.assertEqual(statement["closing_balance"], expected["closing_balance"])
+        self.assertEqual(body["reconciliation"]["status"], expected["reconciliation_status"])
+
+        # --- regression guards: the Phase 2 bug surfaced as income 0 /
+        #     spending 99.40 (the net movement misread as spending) ---
+        self.assertNotEqual(total_income, 0, "total_income must not regress to 0")
+        self.assertNotEqual(total_spending, 99.40, "total_spending must not be the net movement")
+        self.assertEqual(total_spending, 6437.60)
+        self.assertGreater(
+            net_movement, 0,
+            "net movement is positive — Negative Net Cashflow must not be raised",
+        )
+
+        # --- gambling transactions must be present for the risk rule ---
+        gambling_markers = ("WILLIAMHILL", "KALOOKI")
+        gambling = [
+            tx for tx in body["transactions"]
+            if any(marker in (tx["description_raw"] or "").upper() for marker in gambling_markers)
+        ]
+        self.assertEqual(len(gambling), expected["gambling_transaction_count"])
+        self.assertEqual(
+            round(sum(float(tx["paid_out"]) for tx in gambling), 2),
+            expected["gambling_transaction_total"],
+        )
+
     def test_health_includes_available_adapters(self):
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)

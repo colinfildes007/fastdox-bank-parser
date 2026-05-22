@@ -1,0 +1,27 @@
+{
+  "_note": "Post-import pipeline regression expectations for the Lloyds Statement_2026_lloyds.pdf fixture. The summary, categorisation and risk LOGIC lives in Base44, NOT in this parser repo. This file and its test lock the PARSER OUTPUT the pipeline consumes, so a future parser change cannot regress and feed the pipeline bad inputs (the Phase 2 bug: total_income = 0, total_spending = 99.40, a false Negative Net Cashflow flag).",
+  "pipeline_mapping": {
+    "total_income": "statement.total_credits",
+    "total_spending": "statement.total_debits",
+    "net_movement": "total_credits - total_debits"
+  },
+  "total_income": 6537.0,
+  "total_spending": 6437.6,
+  "net_movement": 99.4,
+  "opening_balance": 173.0,
+  "closing_balance": 272.4,
+  "reconciliation_status": "matched",
+  "gambling_transaction_count": 5,
+  "gambling_transaction_total": 360.0,
+  "risk_expectations": {
+    "negative_net_cashflow": "must NOT be raised — net_movement is positive (+99.40)",
+    "gambling_transactions": "may be raised — 5 transactions totalling 360.00",
+    "high_discretionary_spend": "computed against total_spending (6437.60), never net_movement",
+    "review_concentration": "may be raised by Base44 if many AI categories stay review_required"
+  },
+  "regression_guards": {
+    "total_income_must_not_be": 0,
+    "total_spending_must_not_be": 99.4,
+    "net_movement_must_be_positive": true
+  }
+}
