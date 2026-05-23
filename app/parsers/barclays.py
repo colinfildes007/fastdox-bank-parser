@@ -11,7 +11,7 @@ MONTH_TO_NUM = {
     "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
 }
 
-# A Barclays row begins "DD Mmm" (e.g. "20 May").
+# A Barclays row begins with "DD Mmm" (e.g. "20 May").
 DATE_PREFIX = re.compile(
     r"^\s*(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b",
     re.IGNORECASE,
@@ -52,24 +52,34 @@ DEBIT_TYPES = {
 }
 BALANCE_MARKER_TYPES = {"start_balance", "end_balance"}
 
-# Once any of these phrases is seen on a page, transactions stop. Pages 21-22
-# of the sample contain only informational content keyed by these markers.
+TRANSACTION_SECTION_ANCHOR = "your transactions"
+
+# Once any of these phrases is seen, transactions stop. Pages 21-22 of the
+# sample are informational and contain these markers.
 STOP_MARKERS = [
-    "important information",
+    "anything wrong",
+    "credit interest rates",
+    "how it works",
+    "dispute resolution",
+    "important information about compensation",
+    "important information about your account",
     "your benefits at a glance",
     "how to contact",
     "if you change your mind",
     "how to make a complaint",
     "explanation of terms",
-    "about your account",
 ]
+
+# A line that mentions four-of-these and has no money token is a repeated
+# column header and must not be treated as a transaction.
+HEADER_ROW_KEYWORDS = ("date", "description", "money out", "money in", "balance")
 
 
 class BarclaysStatementParser(BaseStatementParser):
     bank_name = "Barclays"
     parser_name = "barclays_family_text_v1"
     parser_adapter = "barclays_family_v1"
-    adapter_version = "1.0.0"
+    adapter_version = "1.0.1"
 
     def can_parse(self, context: Dict) -> bool:
         hint = (context.get("bank_hint") or "").lower()
@@ -86,10 +96,10 @@ class BarclaysStatementParser(BaseStatementParser):
         summary = self._extract_summary(all_text)
         statement_start_date, statement_end_date = self._extract_period(all_text)
 
-        transactions, page_stats, debug_stats = self._parse_transactions(
+        transactions, page_stats, parse_debug = self._parse_transactions(
             pages, statement_start_date, statement_end_date
         )
-        transactions, debug_stats = self._deduplicate(transactions, debug_stats)
+        transactions, parse_debug = self._deduplicate(transactions, parse_debug)
 
         opening_balance = summary.get("start_balance")
         closing_balance = summary.get("end_balance")
@@ -97,10 +107,19 @@ class BarclaysStatementParser(BaseStatementParser):
         statement_total_debits = summary.get("money_out")
 
         calculated_total_credits = round(
-            sum(float(tx.get("paid_in", 0.0)) for tx in transactions), 2
+            sum(float(tx.get("paid_in", 0.0) or 0.0) for tx in transactions), 2
         )
         calculated_total_debits = round(
-            sum(float(tx.get("paid_out", 0.0)) for tx in transactions), 2
+            sum(float(tx.get("paid_out", 0.0) or 0.0) for tx in transactions), 2
+        )
+        rows_with_paid_in = sum(
+            1 for tx in transactions if float(tx.get("paid_in", 0.0) or 0.0) > 0
+        )
+        rows_with_paid_out = sum(
+            1 for tx in transactions if float(tx.get("paid_out", 0.0) or 0.0) > 0
+        )
+        rows_with_balance_after = sum(
+            1 for tx in transactions if tx.get("balance_after") is not None
         )
 
         statement = {
@@ -118,45 +137,67 @@ class BarclaysStatementParser(BaseStatementParser):
         }
         reconciliation_result = reconcile(statement, transactions)
 
-        per_page_counts = {str(s["page_number"]): s["transaction_rows"] for s in page_stats}
+        per_page_counts = {
+            str(stat["page_number"]): stat["transaction_rows"] for stat in page_stats
+        }
 
         parser_debug = {
             "parser_name": self.parser_name,
             "adapter_selected": self.parser_adapter,
             "parser_adapter": self.parser_adapter,
+            "adapter_version": self.adapter_version,
             "page_count": page_count,
             "text_layer_detected": context.get("text_layer_detected", False),
             "summary_block_found": any(
-                summary.get(k) is not None
-                for k in ("start_balance", "end_balance", "money_in", "money_out")
+                summary.get(key) is not None
+                for key in ("start_balance", "end_balance", "money_in", "money_out")
             ),
             "statement_period_found": statement_start_date is not None and statement_end_date is not None,
             "opening_balance_found": opening_balance is not None,
             "closing_balance_found": closing_balance is not None,
             "statement_total_credits_found": statement_total_credits is not None,
             "statement_total_debits_found": statement_total_debits is not None,
-            "transaction_pages_detected": debug_stats.get("transaction_pages_detected", []),
-            "date_matches_found": debug_stats.get("date_matches_found", 0),
-            "candidate_transaction_rows": debug_stats.get("candidate_transaction_rows", 0),
+            "statement_total_credits": statement_total_credits,
+            "statement_total_debits": statement_total_debits,
+            "transaction_pages_considered": parse_debug["pages_considered"],
+            "transaction_pages_skipped": parse_debug["pages_skipped"],
+            "transaction_pages_detected": parse_debug["pages_with_rows"],
+            "date_matches_found": parse_debug["date_matches"],
+            "candidate_rows_found": parse_debug["candidate_rows"],
+            "candidate_transaction_rows": parse_debug["candidate_rows"],
             "transactions_returned": len(transactions),
-            "duplicate_transaction_count": debug_stats.get("duplicate_transaction_count", 0),
+            "non_transaction_rows_discarded": parse_debug["non_transaction_discarded"],
+            "header_rows_discarded": parse_debug["header_discarded"],
+            "start_balance_marker_found": parse_debug["start_balance_seen"],
+            "end_balance_marker_found": parse_debug["end_balance_seen"],
+            "rows_with_paid_out": rows_with_paid_out,
+            "rows_with_paid_in": rows_with_paid_in,
+            "rows_with_balance_after": rows_with_balance_after,
             "calculated_total_credits": calculated_total_credits,
             "calculated_total_debits": calculated_total_debits,
+            "calculated_total_credits_from_returned_transactions": calculated_total_credits,
+            "calculated_total_debits_from_returned_transactions": calculated_total_debits,
+            "duplicate_transaction_count": parse_debug["duplicate_count"],
             "per_page_transaction_counts": per_page_counts,
             "first_transaction": transactions[0] if transactions else None,
             "last_transaction": transactions[-1] if transactions else None,
+            "first_5_transactions": transactions[:5],
+            "last_5_transactions": transactions[-5:],
+            "first_rejected_candidate_rows": parse_debug["first_rejected"],
         }
 
         response = self.build_response(context)
-        response.update({
-            "bank_name": self.bank_name,
-            "statement": statement,
-            "accounts": [],
-            "transactions": transactions,
-            "issues": [],
-            "reconciliation": reconciliation_result,
-            "parser_debug": parser_debug,
-        })
+        response.update(
+            {
+                "bank_name": self.bank_name,
+                "statement": statement,
+                "accounts": [],
+                "transactions": transactions,
+                "issues": [],
+                "reconciliation": reconciliation_result,
+                "parser_debug": parser_debug,
+            }
+        )
         return response
 
     # ---- summary / period --------------------------------------------------
@@ -196,41 +237,109 @@ class BarclaysStatementParser(BaseStatementParser):
         start_date: Optional[str],
         end_date: Optional[str],
     ) -> Tuple[List[Dict], List[Dict], Dict]:
-        transactions: List[Dict] = []
-        page_stats: List[Dict] = []
+        """Parse only the real transaction table — anchored on the
+        "Your transactions" header, terminated at the informational markers.
+
+        Pages before the anchor (e.g. the page-1 accounts overview) and pages
+        after the stop marker (e.g. Important information / Anything wrong /
+        Credit interest rates / How it works / Dispute resolution) are
+        skipped entirely.
+        """
+        pages_considered: List[int] = []
+        pages_skipped: List[int] = []
+        pages_with_rows: List[int] = []
+        first_rejected: List[Dict] = []
         debug = {
-            "transaction_pages_detected": [],
-            "date_matches_found": 0,
-            "candidate_transaction_rows": 0,
+            "pages_considered": pages_considered,
+            "pages_skipped": pages_skipped,
+            "pages_with_rows": pages_with_rows,
+            "date_matches": 0,
+            "candidate_rows": 0,
+            "non_transaction_discarded": 0,
+            "header_discarded": 0,
+            "start_balance_seen": False,
+            "end_balance_seen": False,
+            "first_rejected": first_rejected,
+            "duplicate_count": 0,
         }
 
+        anchor_page = None
         for page in pages:
-            page_text = page.get("text", "") or ""
+            text = (page.get("text") or "").lower()
+            if TRANSACTION_SECTION_ANCHOR in text:
+                anchor_page = page.get("page_number")
+                break
+
+        transactions: List[Dict] = []
+        page_stats: List[Dict] = []
+        stop_reached = False
+
+        for page in pages:
             page_number = page.get("page_number")
+            page_text = page.get("text", "") or ""
 
-            # Pages 21-22 etc. are informational. Cut the page at the first
-            # stop marker so any trailing date-like phrases below it cannot
-            # be parsed as transactions.
-            cut = self._first_stop_offset(page_text.lower())
-            section = page_text[:cut] if cut is not None else page_text
+            if anchor_page is None or page_number is None or page_number < anchor_page or stop_reached:
+                pages_skipped.append(page_number)
+                page_stats.append({"page_number": page_number, "transaction_rows": 0})
+                continue
 
-            rows = self._extract_rows(section)
-            if rows:
-                debug["transaction_pages_detected"].append(page_number)
-            debug["candidate_transaction_rows"] += len(rows)
+            if page_number == anchor_page:
+                idx = page_text.lower().find(TRANSACTION_SECTION_ANCHOR)
+                if idx >= 0:
+                    section_text = page_text[idx + len(TRANSACTION_SECTION_ANCHOR):]
+                else:
+                    section_text = page_text
+            else:
+                section_text = page_text
 
+            stop_offset = self._first_stop_offset(section_text.lower())
+            if stop_offset is not None:
+                section_text = section_text[:stop_offset]
+                stop_reached = True
+
+            if not section_text.strip():
+                pages_skipped.append(page_number)
+                page_stats.append({"page_number": page_number, "transaction_rows": 0})
+                continue
+
+            pages_considered.append(page_number)
+
+            rows = self._extract_rows(section_text)
             page_rows: List[Dict] = []
             for row_index, row in enumerate(rows, start=1):
-                transaction = self._build_transaction(
+                debug["candidate_rows"] += 1
+                transaction, rejection = self._build_transaction(
                     row, page_number, row_index, start_date, end_date
                 )
                 if transaction is None:
+                    if rejection == "header_row":
+                        debug["header_discarded"] += 1
+                    elif rejection == "start_balance":
+                        debug["start_balance_seen"] = True
+                    elif rejection == "end_balance":
+                        debug["end_balance_seen"] = True
+                    else:
+                        debug["non_transaction_discarded"] += 1
+                    if len(first_rejected) < 10:
+                        first_rejected.append(
+                            {
+                                "page_number": page_number,
+                                "row_index": row_index,
+                                "reason": rejection or "unknown",
+                                "text": " ".join(row["lines"])[:200],
+                            }
+                        )
                     continue
-                debug["date_matches_found"] += 1
+                debug["date_matches"] += 1
                 page_rows.append(transaction)
 
+            if page_rows:
+                pages_with_rows.append(page_number)
+
             transactions.extend(page_rows)
-            page_stats.append({"page_number": page_number, "transaction_rows": len(page_rows)})
+            page_stats.append(
+                {"page_number": page_number, "transaction_rows": len(page_rows)}
+            )
 
         return transactions, page_stats, debug
 
@@ -266,36 +375,62 @@ class BarclaysStatementParser(BaseStatementParser):
         row_index: int,
         start_date: Optional[str],
         end_date: Optional[str],
-    ) -> Optional[Dict]:
+    ) -> Tuple[Optional[Dict], Optional[str]]:
         joined = " ".join(row["lines"])
 
-        # Skip the leading date when extracting the description.
+        lowered = joined.lower()
+        header_hits = sum(1 for keyword in HEADER_ROW_KEYWORDS if keyword in lowered)
+        if header_hits >= 4 and not MONEY_TOKEN.search(joined):
+            return None, "header_row"
+
         prefix = DATE_PREFIX.match(joined)
         body_text = joined[prefix.end():] if prefix else joined
 
         money_matches = list(MONEY_TOKEN.finditer(body_text))
         if not money_matches:
-            return None
-        money_tokens = [match.group(0) for match in money_matches]
+            return None, "no_money_tokens"
 
-        # Find where the trailing run of money tokens begins (tokens separated
-        # only by whitespace, anchored at end of body_text). Description is
-        # everything before that.
-        trailing_start = len(body_text)
-        for match in reversed(money_matches):
-            if body_text[match.end():trailing_start].strip() == "":
-                trailing_start = match.start()
+        # Identify the amounts run — the longest consecutive run of money
+        # tokens (separated only by whitespace). Falls back to the last run if
+        # they all have length 1.
+        runs: List[List["re.Match[str]"]] = []
+        current_run: List["re.Match[str]"] = []
+        for match in money_matches:
+            if not current_run:
+                current_run = [match]
+            elif body_text[current_run[-1].end():match.start()].strip() == "":
+                current_run.append(match)
             else:
-                break
-        description = re.sub(r"\s{2,}", " ", body_text[:trailing_start]).strip(" ,;-")
+                runs.append(current_run)
+                current_run = [match]
+        if current_run:
+            runs.append(current_run)
+
+        if not runs:
+            return None, "no_money_tokens"
+        if all(len(run) == 1 for run in runs):
+            amounts_run = runs[-1]
+        else:
+            amounts_run = max(runs, key=len)
+        if len(amounts_run) > 3:
+            amounts_run = amounts_run[-3:]
+
+        amounts_start = amounts_run[0].start()
+        amounts_end = amounts_run[-1].end()
+        money_values = [self._parse_money(match.group(0)) for match in amounts_run]
+
+        description = body_text[:amounts_start] + " " + body_text[amounts_end:]
+        description = re.sub(r"\s{2,}", " ", description).strip(" ,;-.")
+
+        if not re.search(r"[A-Za-z]", description):
+            return None, "empty_description"
 
         derived_type = self._derive_transaction_type(description)
-        # Start/end balance markers are recorded by the summary, not as
-        # transactions.
-        if derived_type in BALANCE_MARKER_TYPES:
-            return None
+        if derived_type == "start_balance":
+            return None, "start_balance"
+        if derived_type == "end_balance":
+            return None, "end_balance"
 
-        money_values = [self._parse_money(t) for t in money_tokens]
         paid_in = 0.0
         paid_out = 0.0
         balance_after: Optional[float] = None
@@ -311,34 +446,42 @@ class BarclaysStatementParser(BaseStatementParser):
             elif derived_type in DEBIT_TYPES:
                 paid_out = amount
             else:
-                # Direction unknown — recorded as a debit by default; the
-                # reconciliation will surface the discrepancy if wrong.
+                # Direction unknown — default to debit; reconciliation will
+                # surface the mismatch if wrong.
                 paid_out = amount
         elif len(money_values) == 1:
-            # Only a balance line (start/end balance handled above; otherwise
-            # not a parsable transaction row).
-            return None
+            amount = money_values[0]
+            if derived_type in CREDIT_TYPES:
+                paid_in = amount
+            elif derived_type in DEBIT_TYPES:
+                paid_out = amount
+            else:
+                # A bare single amount with no direction signal is almost
+                # always a stray balance — skip it.
+                return None, "no_direction_for_single_amount"
+        else:
+            return None, "no_money_tokens"
 
         transaction_date = self._parse_date(row["date_text"], start_date, end_date)
         if transaction_date is None:
-            return None
+            return None, "unparsable_date"
 
-        amount = paid_in if paid_in > 0 else paid_out
+        amount_value = paid_in if paid_in > 0 else paid_out
         direction = "credit" if paid_in > 0 else "debit" if paid_out > 0 else "unknown"
 
-        return {
+        transaction = {
             "transaction_id": None,
             "transaction_date": transaction_date,
             "description_raw": description,
             "description_clean": description,
             "transaction_type": derived_type or "unknown",
             "derived_transaction_type": derived_type or "unknown",
-            "amount": round(amount, 2),
+            "amount": round(amount_value, 2),
             "debit": round(paid_out, 2),
             "credit": round(paid_in, 2),
             "paid_out": round(paid_out, 2),
             "paid_in": round(paid_in, 2),
-            "balance_after": round(balance_after if balance_after is not None else 0.0, 2),
+            "balance_after": round(balance_after, 2) if balance_after is not None else None,
             "type": direction,
             "page_number": page_number or 0,
             "row_index": row_index,
@@ -347,6 +490,7 @@ class BarclaysStatementParser(BaseStatementParser):
             "parser_adapter": self.parser_adapter,
             "confidence": 0.9,
         }
+        return transaction, None
 
     def _derive_transaction_type(self, description: str) -> str:
         text = description or ""
@@ -385,7 +529,6 @@ class BarclaysStatementParser(BaseStatementParser):
             end_year, end_month = int(end_date[:4]), int(end_date[5:7])
             if start_year == end_year:
                 return start_year
-            # spans Dec / Jan
             if month >= start_month:
                 return start_year
             return end_year
@@ -424,5 +567,5 @@ class BarclaysStatementParser(BaseStatementParser):
                 continue
             seen.add(key)
             deduped.append(tx)
-        debug["duplicate_transaction_count"] = removed
+        debug["duplicate_count"] = removed
         return deduped, debug

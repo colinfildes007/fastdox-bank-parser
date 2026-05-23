@@ -153,6 +153,62 @@ class BarclaysFixtureTests(unittest.TestCase):
             self.assertNotEqual(tx["derived_transaction_type"], "start_balance")
             self.assertNotEqual(tx["derived_transaction_type"], "end_balance")
 
+        # --- Defect #2 regression: amounts MUST be present on returned rows ---
+        # Base44 sums paid_in/paid_out from transactions[]. If the parser
+        # returns rows with paid_in == 0 and paid_out == 0 the reconciliation
+        # silently goes to 0/0. Guard that explicitly.
+        self.assertTrue(
+            any(tx["paid_in"] > 0 for tx in body["transactions"]),
+            "every transaction had paid_in == 0",
+        )
+        self.assertTrue(
+            any(tx["paid_out"] > 0 for tx in body["transactions"]),
+            "every transaction had paid_out == 0",
+        )
+        # The sum of paid_in / paid_out across the returned rows must equal
+        # the calculated totals (this is what Base44 recomputes).
+        self.assertEqual(
+            round(sum(tx["paid_in"] for tx in body["transactions"]), 2),
+            expected["statement_total_credits"],
+        )
+        self.assertEqual(
+            round(sum(tx["paid_out"] for tx in body["transactions"]), 2),
+            expected["statement_total_debits"],
+        )
+
+        # --- rich parser_debug: the fields Base44 asked the parser to surface ---
+        for field in (
+            "transaction_pages_considered",
+            "transaction_pages_skipped",
+            "candidate_rows_found",
+            "non_transaction_rows_discarded",
+            "header_rows_discarded",
+            "start_balance_marker_found",
+            "end_balance_marker_found",
+            "rows_with_paid_in",
+            "rows_with_paid_out",
+            "rows_with_balance_after",
+            "calculated_total_credits_from_returned_transactions",
+            "calculated_total_debits_from_returned_transactions",
+            "first_5_transactions",
+            "last_5_transactions",
+            "first_rejected_candidate_rows",
+        ):
+            self.assertIn(field, debug)
+
+        # the synthetic statement contains a start_balance and end_balance row;
+        # both must be detected as markers, not returned as transactions.
+        self.assertTrue(debug["start_balance_marker_found"])
+        self.assertTrue(debug["end_balance_marker_found"])
+        self.assertEqual(
+            debug["calculated_total_credits_from_returned_transactions"],
+            expected["statement_total_credits"],
+        )
+        self.assertEqual(
+            debug["calculated_total_debits_from_returned_transactions"],
+            expected["statement_total_debits"],
+        )
+
         # known transactions are present with the right derived type and amount.
         by_desc_substring = {
             "United Aluminium": ("received_from", 50000.00, 0.0),
@@ -172,7 +228,7 @@ class BarclaysFixtureTests(unittest.TestCase):
     def test_health_lists_barclays_adapter(self):
         body = self.client.get("/health").json()
         self.assertIn("barclays_family_v1", body["available_adapters"])
-        self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.0.0")
+        self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.0.1")
 
     def test_barclays_detected_even_with_noisy_other_bank_mentions(self):
         """A bare 'santander' or 'lloyds' mention buried in a Barclays
