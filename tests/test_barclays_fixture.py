@@ -174,6 +174,64 @@ class BarclaysFixtureTests(unittest.TestCase):
         self.assertIn("barclays_family_v1", body["available_adapters"])
         self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.0.0")
 
+    def test_barclays_detected_even_with_noisy_other_bank_mentions(self):
+        """A bare 'santander' or 'lloyds' mention buried in a Barclays
+        statement (e.g. a merchant description or a footer reference) must
+        not flip detection away from Barclays."""
+        import fitz
+
+        page_1 = [
+            "Barclays Bank UK PLC",
+            "Your Barclays Bank Account statement",
+            "Current account statement",
+            "Sort Code 20-55-59  Account Number 13604152",
+            "Statement period: 19 May - 18 Aug 2023",
+            "",
+            "At a glance",
+            "Start balance       £7.20",
+            "Money in            £51,025.30",
+            "Money out           £51,032.04",
+            "End balance         £0.46",
+            "",
+            "Your transactions",
+            "Date    Description                                          Money out    Money in    Balance",
+            # noisy: a merchant whose name contains "Santander", plus a stray
+            # "lloyds" mention in a transfer reference.
+            "20 May  Card Payment to Santander ATM On 20 May                                          7.20      0.00",
+            "21 May  Transfer to Lloyds Pharmacy Ref: Mobile-Channel       3.50                              0.00",
+        ]
+
+        doc = fitz.open()
+        page = doc.new_page(width=720, height=80 + len(page_1) * 12 + 60)
+        y = 50
+        for line in page_1:
+            page.insert_text((40, y), line, fontsize=8)
+            y += 12
+        pdf_bytes = doc.write()
+
+        response = self._post_pdf(pdf_bytes)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+
+        self.assertEqual(body["detected_bank"], "Barclays")
+        self.assertEqual(body["parser_adapter"], "barclays_family_v1")
+        self.assertGreaterEqual(body["bank_detection_confidence"], 0.95)
+
+        debug = body["parser_debug"]
+        self.assertIn("bank_detection_candidates", debug)
+        candidates = debug["bank_detection_candidates"]
+        self.assertEqual(debug["selected_bank"], "Barclays")
+        self.assertEqual(debug["selected_adapter"], "barclays_family_v1")
+        self.assertIn("Barclays", candidates)
+        self.assertIn("Santander", candidates)
+        self.assertIn("Lloyds Bank", candidates)
+        # Barclays score must beat the runner-up by a comfortable margin.
+        barclays_score = candidates["Barclays"]["score"]
+        other_scores = [
+            data["score"] for bank, data in candidates.items() if bank != "Barclays"
+        ]
+        self.assertGreater(barclays_score, max(other_scores) + 20)
+
 
 if __name__ == "__main__":
     unittest.main()

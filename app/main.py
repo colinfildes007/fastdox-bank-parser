@@ -140,6 +140,14 @@ def process_pdf_file(pdf_path: str, document_id: str, original_filename: Optiona
         parser_adapter = getattr(parser, "parser_adapter", parser.parser_name)
         parser_metadata["parser_adapter"] = parser_adapter
 
+        # Surface the full bank-detection candidate table so misdetections can
+        # be diagnosed without re-running the parse.
+        parser_debug = parser_result.get("parser_debug", {})
+        parser_debug.setdefault("bank_detection_candidates", detection.get("bank_detection_candidates"))
+        parser_debug.setdefault("selected_bank", detection.get("selected_bank"))
+        parser_debug.setdefault("selected_adapter", detection.get("selected_adapter"))
+        parser_debug.setdefault("detection_margin", detection.get("detection_margin"))
+
         status = "success"
         if reconciliation_result["status"] != "matched":
             status = reconciliation_result["status"]
@@ -159,7 +167,7 @@ def process_pdf_file(pdf_path: str, document_id: str, original_filename: Optiona
             "statement": parser_result.get("statement", {}),
             "accounts": parser_result.get("accounts", []),
             "issues": parser_result.get("issues", []),
-            "parser_debug": parser_result.get("parser_debug", {}),
+            "parser_debug": parser_debug,
             "parser_metadata": parser_metadata,
             "bank_detection_conflict": detection.get("bank_detection_conflict", False),
         }
