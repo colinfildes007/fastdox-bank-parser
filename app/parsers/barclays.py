@@ -115,7 +115,7 @@ class BarclaysStatementParser(BaseStatementParser):
     bank_name = "Barclays"
     parser_name = "barclays_family_text_v1"
     parser_adapter = "barclays_family_v1"
-    adapter_version = "1.0.3"
+    adapter_version = "1.0.4"
 
     def can_parse(self, context: Dict) -> bool:
         hint = (context.get("bank_hint") or "").lower()
@@ -189,6 +189,21 @@ class BarclaysStatementParser(BaseStatementParser):
         transactions_matching_united_aluminium = [
             tx for tx in transactions
             if "united aluminium" in (tx.get("description_raw") or "").lower()
+        ]
+        transactions_matching_valerie = [
+            tx for tx in transactions
+            if "valerie" in (tx.get("description_raw") or "").lower()
+        ]
+        rejection_related_rows = [
+            tx for tx in transactions
+            if tx.get("derived_transaction_type") in ("rejection", "refund", "reversal")
+            or any(
+                keyword in (tx.get("description_raw") or "").lower()
+                for keyword in (
+                    "rejection", "payee bank response",
+                    "unable to receive credits", "refund", "reversal",
+                )
+            )
         ]
         rows_near_missing_credit = [
             sample for sample in parse_debug["first_rejected"]
@@ -269,6 +284,8 @@ class BarclaysStatementParser(BaseStatementParser):
             "rows_near_missing_credit": rows_near_missing_credit,
             "transactions_on_2023_05_26": transactions_on_2023_05_26,
             "transactions_matching_united_aluminium": transactions_matching_united_aluminium,
+            "transactions_matching_valerie": transactions_matching_valerie,
+            "rejection_related_rows": rejection_related_rows,
             "rows_rejected_by_reason": parse_debug["rows_rejected_by_reason"],
             "per_page": per_page,
             "per_page_credit_sums": per_page_credit_sums,
@@ -547,14 +564,22 @@ class BarclaysStatementParser(BaseStatementParser):
                 }
                 continue
 
-            # No phrase. If the current row is already "closed" (its last
-            # line is money-only), start a fresh anonymous row instead of
-            # appending — otherwise unrelated content gets merged in.
-            if current_row is not None and self._row_has_trailing_money(current_row):
-                rows.append(current_row)
+            # Rejection block split: when a "Payee Bank Response" / "Account
+            # Unable to Receive Credits" line arrives, finalise the current
+            # row. If its last accumulated line is a payee-style reference
+            # ("Valerie Sherwo Ref: Paul" — contains "Ref:" mid-text), pop
+            # that line into the new rejection row so it isn't tacked onto
+            # the previous credit's description.
+            if self._is_rejection_split_trigger(content):
+                new_first_line: Optional[str] = None
+                if current_row is not None:
+                    if self._last_line_is_rejection_payee(current_row):
+                        new_first_line = current_row["lines"].pop()
+                    rows.append(current_row)
+                new_lines = [new_first_line, content] if new_first_line else [content]
                 current_row = {
                     "date_text": current_date_text,
-                    "lines": [content],
+                    "lines": new_lines,
                 }
                 continue
 
@@ -566,21 +591,36 @@ class BarclaysStatementParser(BaseStatementParser):
 
         return rows, current_date_text
 
-    def _row_has_trailing_money(self, row: Dict) -> bool:
-        """True when the row's last line is just one or more money tokens
-        (a Barclays "amount on its own line"). Trailing ``CR`` / ``DR``
-        suffixes are tolerated."""
+    def _is_rejection_split_trigger(self, content: str) -> bool:
+        lower = content.lower().strip()
+        return (
+            lower.startswith("payee bank response")
+            or lower.startswith("account unable to receive credits")
+        )
+
+    def _last_line_is_rejection_payee(self, row: Dict) -> bool:
+        """Heuristic: a row's last line belongs to the *next* rejection block
+        (and should be popped) when it looks like a payee reference — contains
+        ``Ref:`` somewhere mid-text but does not start with ``Ref:``, is not a
+        money-only line, and is not the phrase line that started the row.
+        """
         lines = row.get("lines") or []
-        if not lines:
+        if len(lines) < 2:  # never pop the only line (the phrase line)
             return False
         last_line = lines[-1].strip()
-        if not last_line or not MONEY_TOKEN.search(last_line):
+        if not last_line:
             return False
-        remainder = MONEY_TOKEN.sub("", last_line)
-        remainder = re.sub(r"\s+", " ", remainder).strip()
-        if remainder == "":
-            return True
-        return bool(re.fullmatch(r"(?:CR|DR|Cr|Dr)", remainder))
+        lower = last_line.lower()
+        if lower.startswith("ref:"):
+            return False
+        if self._match_transaction_phrase(last_line) is not None:
+            return False
+        if MONEY_TOKEN.search(last_line):
+            remainder = MONEY_TOKEN.sub("", last_line)
+            remainder = re.sub(r"\s+", "", remainder).strip()
+            if remainder == "":
+                return False  # money-only line
+        return "ref:" in lower
 
     def _match_transaction_phrase(self, content: str) -> Optional[str]:
         lower = content.lower()
