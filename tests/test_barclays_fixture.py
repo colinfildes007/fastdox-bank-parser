@@ -228,7 +228,7 @@ class BarclaysFixtureTests(unittest.TestCase):
     def test_health_lists_barclays_adapter(self):
         body = self.client.get("/health").json()
         self.assertIn("barclays_family_v1", body["available_adapters"])
-        self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.0.2")
+        self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.0.3")
 
     def test_barclays_grouped_dates_and_credit_phrases(self):
         """Real Barclays statements group several transactions under a single
@@ -320,7 +320,7 @@ class BarclaysFixtureTests(unittest.TestCase):
         debug = body["parser_debug"]
         self.assertIn("deterministic_run_id", debug)
         self.assertIn("page_processing_order", debug)
-        self.assertEqual(debug["adapter_version"], "1.0.2")
+        self.assertEqual(debug["adapter_version"], "1.0.3")
         self.assertEqual(debug["credit_rows_returned"], 3)
         self.assertEqual(debug["debit_rows_returned"], 3)
         self.assertEqual(debug["credit_amount_sum"], 5215.65)
@@ -370,6 +370,92 @@ class BarclaysFixtureTests(unittest.TestCase):
             debug["deterministic_run_id"],
         )
         self.assertEqual(body_again["transactions"], body["transactions"])
+
+    def test_barclays_rejection_block_does_not_merge_with_previous_credit(self):
+        """A 'Received From' credit followed by a rejection/refund block must
+        produce TWO separate credit rows, not one merged row that loses the
+        first amount. This guards the £3,415.65 missing-credit regression
+        reported on the real Statement 18-aug-23 ac 13604152.PDF.
+        """
+        import fitz
+
+        lines = [
+            "Barclays Bank UK PLC",
+            "Your Barclays Bank Account statement",
+            "Current account statement",
+            "Sort Code 20-55-59  Account Number 13604152",
+            "Statement period: 26 May - 27 May 2023",
+            "At a glance",
+            "Start balance       £100.00",
+            "Money in            £3,915.65",
+            "Money out           £0.00",
+            "End balance         £4,015.65",
+            "Your transactions",
+            "26 May",
+            "Received From United Aluminium L",
+            "Ref: United Aluminium",
+            "3,415.65",
+            # Rejection block — must NOT merge into the Received From row.
+            "Valerie Sherwo Ref: Paul",
+            "Payee Bank Response: Account Unable to Receive Credits.",
+            "Rejection",
+            "500.00 816.85",
+        ]
+        info_page = ["Important information about your account"]
+
+        doc = fitz.open()
+        page = doc.new_page(width=720, height=80 + len(lines) * 12 + 60)
+        y = 50
+        for line in lines:
+            page.insert_text((40, y), line, fontsize=8)
+            y += 12
+        page = doc.new_page(width=720, height=80 + len(info_page) * 12 + 60)
+        y = 50
+        for line in info_page:
+            page.insert_text((40, y), line, fontsize=8)
+            y += 12
+        pdf_bytes = doc.write()
+
+        response = self._post_pdf(pdf_bytes)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+
+        debug = body["parser_debug"]
+        united = next(
+            (tx for tx in body["transactions"]
+             if "united aluminium" in tx["description_raw"].lower()),
+            None,
+        )
+        self.assertIsNotNone(united, "Received From United Aluminium row missing")
+        self.assertEqual(united["derived_transaction_type"], "received_from")
+        self.assertEqual(united["paid_in"], 3415.65)
+        self.assertEqual(united["paid_out"], 0.0)
+        self.assertEqual(united["transaction_date"], "2023-05-26")
+
+        rejection = next(
+            (tx for tx in body["transactions"]
+             if "rejection" in tx["description_raw"].lower()),
+            None,
+        )
+        self.assertIsNotNone(rejection, "Rejection refund row missing")
+        self.assertEqual(rejection["derived_transaction_type"], "rejection")
+        self.assertEqual(rejection["paid_in"], 500.0)
+        self.assertEqual(rejection["paid_out"], 0.0)
+        self.assertEqual(rejection["balance_after"], 816.85)
+        # the rejection block inherits the carried-forward date.
+        self.assertEqual(rejection["transaction_date"], "2023-05-26")
+
+        # The targeted diagnostic slices exist and contain both rows.
+        self.assertIn("transactions_on_2023_05_26", debug)
+        self.assertIn("transactions_matching_united_aluminium", debug)
+        self.assertEqual(len(debug["transactions_matching_united_aluminium"]), 1)
+        dates = {tx["transaction_date"] for tx in debug["transactions_on_2023_05_26"]}
+        self.assertEqual(dates, {"2023-05-26"})
+        self.assertGreaterEqual(len(debug["transactions_on_2023_05_26"]), 2)
+
+        # per_page_credit_sums / per_page_debit_sums are reported.
+        self.assertIn("per_page_credit_sums", debug)
+        self.assertIn("per_page_debit_sums", debug)
 
     def test_barclays_detected_even_with_noisy_other_bank_mentions(self):
         """A bare 'santander' or 'lloyds' mention buried in a Barclays

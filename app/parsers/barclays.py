@@ -39,7 +39,10 @@ IBAN_RE = re.compile(r"\b(GB\d{2}\s*[A-Z]{4}(?:\s*\d{2,4}){3,5})\b")
 SWIFT_RE = re.compile(r"\b(?:BIC|SWIFT)\b[^A-Z0-9]*([A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\b", re.IGNORECASE)
 HOLDER_RE = re.compile(r"\b(M(?:r|rs|iss|s)\.?\s+[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){1,4})\b")
 
-# Description prefix -> derived transaction type. Longest / most-specific first.
+# Description prefix -> derived transaction type. Explicit Barclays phrases
+# are matched first; the bare rejection / refund / reversal keywords are a
+# catch-all credit indicator for rows that don't start with a known phrase
+# (e.g. the rejection block "Valerie Sherwo Ref: Paul ... Rejection 500.00").
 TRANSACTION_TYPE_PATTERNS = [
     (re.compile(r"start\s+balance", re.IGNORECASE), "start_balance"),
     (re.compile(r"end\s+balance", re.IGNORECASE), "end_balance"),
@@ -53,6 +56,11 @@ TRANSACTION_TYPE_PATTERNS = [
     (re.compile(r"received\s+from", re.IGNORECASE), "received_from"),
     (re.compile(r"transfer\s+from", re.IGNORECASE), "transfer_from"),
     (re.compile(r"transfer\s+to", re.IGNORECASE), "transfer_to"),
+    # Generic credit indicators — last so they only fire on rows without an
+    # explicit phrase prefix.
+    (re.compile(r"\brejection\b", re.IGNORECASE), "rejection"),
+    (re.compile(r"\brefund\b", re.IGNORECASE), "refund"),
+    (re.compile(r"\breversal\b", re.IGNORECASE), "reversal"),
 ]
 
 # Phrases that mark the start of a transaction. Each new occurrence finalises
@@ -74,7 +82,11 @@ TRANSACTION_PHRASES = [
     "end balance",
 ]
 
-CREDIT_TYPES = {"received_from", "transfer_from", "bill_payment_from"}
+CREDIT_TYPES = {
+    "received_from", "transfer_from", "bill_payment_from",
+    # rejected outbound payments come back as money in -> credit.
+    "rejection", "refund", "reversal",
+}
 DEBIT_TYPES = {
     "card_payment", "card_purchase", "bill_payment", "bill_payment_to",
     "transfer_to", "direct_debit", "cash_machine_withdrawal",
@@ -103,7 +115,7 @@ class BarclaysStatementParser(BaseStatementParser):
     bank_name = "Barclays"
     parser_name = "barclays_family_text_v1"
     parser_adapter = "barclays_family_v1"
-    adapter_version = "1.0.2"
+    adapter_version = "1.0.3"
 
     def can_parse(self, context: Dict) -> bool:
         hint = (context.get("bank_hint") or "").lower()
@@ -151,18 +163,42 @@ class BarclaysStatementParser(BaseStatementParser):
         )
 
         per_page = []
+        per_page_credit_sums: Dict[str, float] = {}
+        per_page_debit_sums: Dict[str, float] = {}
         for stat in page_stats:
             page_number = stat["page_number"]
             page_txns = [t for t in transactions if t.get("page_number") == page_number]
+            credit_sum = round(sum(float(t.get("paid_in", 0.0) or 0.0) for t in page_txns), 2)
+            debit_sum = round(sum(float(t.get("paid_out", 0.0) or 0.0) for t in page_txns), 2)
             per_page.append(
                 {
                     "page_number": page_number,
                     "credit_rows": sum(1 for t in page_txns if float(t.get("paid_in", 0.0) or 0.0) > 0),
                     "debit_rows": sum(1 for t in page_txns if float(t.get("paid_out", 0.0) or 0.0) > 0),
-                    "credit_sum": round(sum(float(t.get("paid_in", 0.0) or 0.0) for t in page_txns), 2),
-                    "debit_sum": round(sum(float(t.get("paid_out", 0.0) or 0.0) for t in page_txns), 2),
+                    "credit_sum": credit_sum,
+                    "debit_sum": debit_sum,
                 }
             )
+            per_page_credit_sums[str(page_number)] = credit_sum
+            per_page_debit_sums[str(page_number)] = debit_sum
+
+        # Targeted diagnostic slices for inspecting reconciliation deltas.
+        transactions_on_2023_05_26 = [
+            tx for tx in transactions if tx.get("transaction_date") == "2023-05-26"
+        ]
+        transactions_matching_united_aluminium = [
+            tx for tx in transactions
+            if "united aluminium" in (tx.get("description_raw") or "").lower()
+        ]
+        rows_near_missing_credit = [
+            sample for sample in parse_debug["first_rejected"]
+            if "united aluminium" in sample.get("text", "").lower()
+            or sample.get("text", "").lower().startswith("rejection")
+        ]
+        ambiguous_amount_rows = [
+            sample for sample in parse_debug["first_rejected"]
+            if sample.get("reason") == "no_direction_for_single_amount"
+        ]
 
         statement = {
             "bank_name": self.bank_name,
@@ -227,8 +263,16 @@ class BarclaysStatementParser(BaseStatementParser):
             "debit_amount_sum": calculated_total_debits,
             "missing_credit_examples": parse_debug["missing_credit_examples"],
             "missing_debit_examples": parse_debug["missing_debit_examples"],
+            "rejected_credit_candidates": parse_debug["missing_credit_examples"],
+            "rejected_debit_candidates": parse_debug["missing_debit_examples"],
+            "ambiguous_amount_rows": ambiguous_amount_rows,
+            "rows_near_missing_credit": rows_near_missing_credit,
+            "transactions_on_2023_05_26": transactions_on_2023_05_26,
+            "transactions_matching_united_aluminium": transactions_matching_united_aluminium,
             "rows_rejected_by_reason": parse_debug["rows_rejected_by_reason"],
             "per_page": per_page,
+            "per_page_credit_sums": per_page_credit_sums,
+            "per_page_debit_sums": per_page_debit_sums,
             "calculated_total_credits": calculated_total_credits,
             "calculated_total_debits": calculated_total_debits,
             "calculated_total_credits_from_returned_transactions": calculated_total_credits,
@@ -386,7 +430,11 @@ class BarclaysStatementParser(BaseStatementParser):
                     row, page_number, row_index, start_date, end_date
                 )
 
-                derived_type = row.get("derived_type")
+                row_text = " ".join(row.get("lines") or [])
+                if transaction is not None:
+                    derived_type = transaction.get("derived_transaction_type")
+                else:
+                    derived_type = self._derive_transaction_type(row_text)
                 if derived_type in CREDIT_TYPES:
                     debug["credit_candidates"] += 1
                 elif derived_type in DEBIT_TYPES:
@@ -455,11 +503,20 @@ class BarclaysStatementParser(BaseStatementParser):
         """Build transaction rows from a section of statement text.
 
         A Barclays section commonly shows one date followed by several
-        transactions (no date prefix per row). The row delimiter is the
-        next *transaction phrase* (``Card Payment to``, ``Received From``,
-        ``Bill Payment From``…) and the date carries forward until a new
-        date appears. Returns ``(rows, last_carried_date_text)`` so the
-        carry-forward survives page boundaries.
+        transactions (no date prefix per row). Rows are delimited two ways:
+
+        1. A *transaction phrase* (``Card Payment to``, ``Received From``,
+           ``Bill Payment From``, …) always starts a new row.
+        2. When the current row's last line is *money-only* (e.g. a bare
+           ``3,415.65`` on its own line) the row is considered closed; the
+           next non-empty content line starts a new *anonymous* row even
+           if it doesn't begin with a known phrase. This is how the
+           rejection block ``Valerie Sherwo Ref: Paul ... Rejection 500.00``
+           gets separated from the preceding ``Received From United
+           Aluminium L Ref: United Aluminium 3,415.65`` row.
+
+        The date carries forward across rows and across page boundaries.
+        Returns ``(rows, last_carried_date_text)``.
         """
         rows: List[Dict] = []
         current_date_text = carried_date_text
@@ -484,19 +541,46 @@ class BarclaysStatementParser(BaseStatementParser):
             if phrase is not None:
                 if current_row is not None:
                     rows.append(current_row)
-                derived_type = self._derive_transaction_type(content)
                 current_row = {
                     "date_text": current_date_text,
                     "lines": [content],
-                    "derived_type": derived_type,
                 }
-            elif current_row is not None:
+                continue
+
+            # No phrase. If the current row is already "closed" (its last
+            # line is money-only), start a fresh anonymous row instead of
+            # appending — otherwise unrelated content gets merged in.
+            if current_row is not None and self._row_has_trailing_money(current_row):
+                rows.append(current_row)
+                current_row = {
+                    "date_text": current_date_text,
+                    "lines": [content],
+                }
+                continue
+
+            if current_row is not None:
                 current_row["lines"].append(content)
 
         if current_row is not None:
             rows.append(current_row)
 
         return rows, current_date_text
+
+    def _row_has_trailing_money(self, row: Dict) -> bool:
+        """True when the row's last line is just one or more money tokens
+        (a Barclays "amount on its own line"). Trailing ``CR`` / ``DR``
+        suffixes are tolerated."""
+        lines = row.get("lines") or []
+        if not lines:
+            return False
+        last_line = lines[-1].strip()
+        if not last_line or not MONEY_TOKEN.search(last_line):
+            return False
+        remainder = MONEY_TOKEN.sub("", last_line)
+        remainder = re.sub(r"\s+", " ", remainder).strip()
+        if remainder == "":
+            return True
+        return bool(re.fullmatch(r"(?:CR|DR|Cr|Dr)", remainder))
 
     def _match_transaction_phrase(self, content: str) -> Optional[str]:
         lower = content.lower()
@@ -554,7 +638,7 @@ class BarclaysStatementParser(BaseStatementParser):
         if not re.search(r"[A-Za-z]", description):
             return None, "empty_description"
 
-        derived_type = row.get("derived_type") or self._derive_transaction_type(description)
+        derived_type = self._derive_transaction_type(description)
         if derived_type == "start_balance":
             return None, "start_balance"
         if derived_type == "end_balance":
