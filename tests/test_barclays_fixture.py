@@ -228,7 +228,148 @@ class BarclaysFixtureTests(unittest.TestCase):
     def test_health_lists_barclays_adapter(self):
         body = self.client.get("/health").json()
         self.assertIn("barclays_family_v1", body["available_adapters"])
-        self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.0.1")
+        self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.0.2")
+
+    def test_barclays_grouped_dates_and_credit_phrases(self):
+        """Real Barclays statements group several transactions under a single
+        date line, with no date prefix per row. The date must carry forward
+        until the next date appears, and each transaction is delimited by its
+        leading phrase (Card Payment to, Received From, Bill Payment From,
+        Transfer From, Direct Debit to, Transfer to, ...).
+
+        This guards against the Defect #2 follow-up — a single date row was
+        being collapsed into one mega-row, and Bill Payment From / Transfer
+        From / Received From were not being recognised as credits.
+        """
+        import fitz
+
+        lines = [
+            "Barclays Bank UK PLC",
+            "Your Barclays Bank Account statement",
+            "Current account statement",
+            "Mr Paul Michael Sherwood",
+            "Sort Code 20-55-59  Account Number 13604152",
+            "IBAN GB56 BUKB 2055 5913 6041 52",
+            "BIC BUKBGB22",
+            "Statement period: 30 May - 01 Jun 2023",
+            "At a glance",
+            "Start balance       £100.00",
+            "Money in            £5,215.65",
+            "Money out           £5,056.45",
+            "End balance         £259.20",
+            "Your transactions",
+            "Date Description Money out Money in Balance",
+            # grouped under "30 May" — no per-row date prefix
+            "30 May",
+            "Card Payment to Greggs @ Mfg",
+            "Green On 28 May",
+            "6.45",
+            "Bill Payment From Kalooki Off Cour F",
+            "Ref: PS379",
+            "1,600.00",
+            "Transfer From Sort Code 20-55-59",
+            "Account 93180263",
+            "Ref: Mobile-Channel",
+            "200.00",
+            # next date — carries forward
+            "01 Jun",
+            "Received From United Aluminium L",
+            "Ref: United Aluminium",
+            "3,415.65",
+            "Transfer to Sort Code 20-55-59",
+            "Account 93180263",
+            "Ref: Mobile-Channel",
+            "5,000.00",
+            "Direct Debit to O2",
+            "Ref: Ged63493634",
+            "50.00",
+        ]
+        info_page = ["Important information about your account"]
+
+        doc = fitz.open()
+        page = doc.new_page(width=720, height=80 + len(lines) * 12 + 60)
+        y = 50
+        for line in lines:
+            page.insert_text((40, y), line, fontsize=8)
+            y += 12
+        page = doc.new_page(width=720, height=80 + len(info_page) * 12 + 60)
+        y = 50
+        for line in info_page:
+            page.insert_text((40, y), line, fontsize=8)
+            y += 12
+        pdf_bytes = doc.write()
+
+        response = self._post_pdf(pdf_bytes)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+
+        self.assertEqual(body["detected_bank"], "Barclays")
+        self.assertEqual(body["parser_adapter"], "barclays_family_v1")
+        self.assertEqual(body["statement"]["statement_start_date"], "2023-05-30")
+        self.assertEqual(body["statement"]["statement_end_date"], "2023-06-01")
+        self.assertEqual(body["statement"]["opening_balance"], 100.0)
+        self.assertEqual(body["statement"]["closing_balance"], 259.2)
+        self.assertEqual(body["statement"]["total_credits"], 5215.65)
+        self.assertEqual(body["statement"]["total_debits"], 5056.45)
+
+        recon = body["reconciliation"]
+        self.assertEqual(recon["status"], "matched")
+        self.assertEqual(recon["calculated_total_credits"], 5215.65)
+        self.assertEqual(recon["calculated_total_debits"], 5056.45)
+
+        debug = body["parser_debug"]
+        self.assertIn("deterministic_run_id", debug)
+        self.assertIn("page_processing_order", debug)
+        self.assertEqual(debug["adapter_version"], "1.0.2")
+        self.assertEqual(debug["credit_rows_returned"], 3)
+        self.assertEqual(debug["debit_rows_returned"], 3)
+        self.assertEqual(debug["credit_amount_sum"], 5215.65)
+        self.assertEqual(debug["debit_amount_sum"], 5056.45)
+        self.assertGreaterEqual(debug["credit_candidate_rows_found"], 3)
+        self.assertGreaterEqual(debug["debit_candidate_rows_found"], 3)
+        self.assertIn("rows_rejected_by_reason", debug)
+        self.assertIn("per_page", debug)
+
+        # Account metadata
+        statement = body["statement"]
+        self.assertEqual(statement["sort_code"], "20-55-59")
+        self.assertEqual(statement["account_number"], "13604152")
+        self.assertEqual(statement["iban"], "GB56 BUKB 2055 5913 6041 52")
+        self.assertEqual(statement["swift_bic"], "BUKBGB22")
+        self.assertIn("Paul Michael Sherwood", statement["account_holder"] or "")
+
+        # The six transactions are present with the right derived types.
+        by_marker = {
+            "Greggs": ("card_payment", "debit", 6.45, "2023-05-30"),
+            "Kalooki Off Cour": ("bill_payment_from", "credit", 1600.0, "2023-05-30"),
+            "Transfer From Sort Code": ("transfer_from", "credit", 200.0, "2023-05-30"),
+            "United Aluminium": ("received_from", "credit", 3415.65, "2023-06-01"),
+            "Transfer to Sort Code": ("transfer_to", "debit", 5000.0, "2023-06-01"),
+            "O2": ("direct_debit", "debit", 50.0, "2023-06-01"),
+        }
+        for marker, (expected_type, direction, amount, date) in by_marker.items():
+            tx = next(
+                (t for t in body["transactions"] if marker in t["description_raw"]),
+                None,
+            )
+            self.assertIsNotNone(tx, f"missing transaction for marker {marker!r}")
+            self.assertEqual(tx["derived_transaction_type"], expected_type)
+            self.assertEqual(tx["transaction_date"], date)
+            if direction == "credit":
+                self.assertEqual(tx["paid_in"], amount)
+                self.assertEqual(tx["paid_out"], 0.0)
+            else:
+                self.assertEqual(tx["paid_out"], amount)
+                self.assertEqual(tx["paid_in"], 0.0)
+
+        # Determinism: parsing the same PDF twice gives an identical result.
+        body_again = self._post_pdf(pdf_bytes).json()
+        self.assertEqual(body_again["transaction_count"], body["transaction_count"])
+        self.assertEqual(
+            body_again["parser_debug"]["deterministic_run_id"],
+            debug["deterministic_run_id"],
+        )
+        self.assertEqual(body_again["transactions"], body["transactions"])
 
     def test_barclays_detected_even_with_noisy_other_bank_mentions(self):
         """A bare 'santander' or 'lloyds' mention buried in a Barclays
