@@ -1,5 +1,6 @@
 from typing import Any, Dict, Optional, Sequence
 
+from app.parsers.barclays import BarclaysStatementParser
 from app.parsers.base import BaseStatementParser
 from app.parsers.generic_table import GenericTableParser
 from app.parsers.lloyds import LloydsStatementParser
@@ -41,17 +42,23 @@ HINT_TO_CANONICAL = {
     "halifax": "Halifax",
     "bank of scotland": "Bank of Scotland",
     "bos": "Bank of Scotland",
+    "barclays": "Barclays",
 }
 
 BANK_ADAPTERS = {
     "Santander": "santander_v1",
+    "Barclays": "barclays_family_v1",
     "Lloyds Bank": "lloyds_family_v1",
     "Halifax": "lloyds_family_v1",
     "Bank of Scotland": "lloyds_family_v1",
 }
 
+# Barclays is listed before Lloyds Bank so that a Barclays statement, which
+# also says "Money in" / "Money out" in its At-a-glance block, wins the
+# tie-break on equal-confidence detection.
 BANK_SIGNATURES = {
     "Santander": ["santander uk plc", "santander"],
+    "Barclays": ["barclays bank uk plc", "barclays bank", "barclays"],
     "Lloyds Bank": ["lloyds bank", "lloyds", "classic", "club lloyds", "money in", "money out", "balance on"],
     "Halifax": ["halifax"],
     "Bank of Scotland": ["bank of scotland"],
@@ -181,7 +188,14 @@ def detect_bank(pages: Sequence[Dict[str, Any]], bank_hint: Optional[str] = None
 
 
 def available_parsers() -> Sequence[BaseStatementParser]:
-    return [SantanderStatementParser(), LloydsStatementParser(), GenericTableParser()]
+    # Barclays is selected before Lloyds because Lloyds' can_parse matches the
+    # generic "Money in" / "Money out" markers that also appear in Barclays.
+    return [
+        SantanderStatementParser(),
+        BarclaysStatementParser(),
+        LloydsStatementParser(),
+        GenericTableParser(),
+    ]
 
 
 def select_parser(context: Dict) -> BaseStatementParser:

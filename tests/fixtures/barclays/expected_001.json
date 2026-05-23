@@ -1,0 +1,12 @@
+{
+  "_comment": "Expected acceptance result for the Barclays Current Account statement fixture (Statement 18-aug-23 ac 13604152.PDF format). Reproduced by build_barclays_sample_pdf().",
+  "bank_name": "Barclays",
+  "parser_adapter": "barclays_family_v1",
+  "statement_start_date": "2023-05-19",
+  "statement_end_date": "2023-08-18",
+  "opening_balance": 7.20,
+  "statement_total_credits": 51025.30,
+  "statement_total_debits": 51032.04,
+  "closing_balance": 0.46,
+  "reconciliation_status": "matched"
+}
