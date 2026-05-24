@@ -168,7 +168,7 @@ class BarclaysStatementParser(BaseStatementParser):
     bank_name = "Barclays"
     parser_name = "barclays_family_text_v1"
     parser_adapter = "barclays_family_v1"
-    adapter_version = "1.0.9"
+    adapter_version = "1.1.0"
 
     def can_parse(self, context: Dict) -> bool:
         hint = (context.get("bank_hint") or "").lower()
@@ -1041,6 +1041,43 @@ class BarclaysStatementParser(BaseStatementParser):
                 return phrase
         return None
 
+    # Withdrawal amount embedded directly in the description:
+    #   "Cash Machine Withdrawal at 130.00 Notemachine Shell ..."
+    # The amount sits immediately after "at"; the trailing Money out /
+    # Balance column is unreliable on this layout (it commonly carries a
+    # fee or an empty column that the parser would otherwise pick as
+    # paid_out).
+    _CASH_MACHINE_INLINE_RE = re.compile(
+        r"(?:cash\s+machine\s+withdrawal|atm\s+withdrawal|cashpoint)"
+        r"\s+at\s+(\d{1,3}(?:,\d{3})*\.\d{2})\b",
+        re.IGNORECASE,
+    )
+    # Foreign-currency card payments: the trailing amount column carries
+    # only the non-sterling transaction fee. The actual GBP debit sits
+    # inline in the description, right after the payee name and before
+    # the country / foreign-currency tokens.
+    _FX_MARKERS = (
+        "non-sterling transaction fee",
+        "non sterling transaction fee",
+        "final gbp amount",
+        "exchange rate",
+    )
+
+    def _inline_amount_override(self, body_text: str) -> Optional[Tuple[float, str]]:
+        """Return ``(amount, source)`` when a Barclays row carries its real
+        debit amount inside the description (cash-machine / ATM and
+        foreign-currency card-payment formats). Returns ``None`` for the
+        default amounts-column behaviour."""
+        match = self._CASH_MACHINE_INLINE_RE.search(body_text)
+        if match:
+            return self._parse_money(match.group(1)), "cash_machine_inline"
+        lower = body_text.lower()
+        if any(marker in lower for marker in self._FX_MARKERS):
+            first = MONEY_TOKEN.search(body_text)
+            if first:
+                return self._parse_money(first.group(0)), "non_sterling_inline"
+        return None
+
     def _diagnose_row(
         self,
         row: Dict,
@@ -1105,6 +1142,14 @@ class BarclaysStatementParser(BaseStatementParser):
             elif derived_type in DEBIT_TYPES:
                 paid_out = amt
 
+        # Mirror the inline-amount override used by _build_transaction so
+        # the balance_chain reflects what would actually be emitted.
+        inline_source: Optional[str] = None
+        inline_override = self._inline_amount_override(joined)
+        if inline_override is not None:
+            paid_out, inline_source = inline_override[0], inline_override[1]
+            paid_in = 0.0
+
         parsed_date = self._parse_date(row.get("date_text"), start_date, end_date)
         return {
             "parsed_date": parsed_date,
@@ -1115,6 +1160,7 @@ class BarclaysStatementParser(BaseStatementParser):
             "parsed_money_in": round(paid_in, 2),
             "parsed_money_out": round(paid_out, 2),
             "parsed_balance": round(balance_after, 2) if balance_after is not None else None,
+            "inline_amount_source": inline_source,
         }
 
     @staticmethod
@@ -1217,6 +1263,18 @@ class BarclaysStatementParser(BaseStatementParser):
         if transaction_date is None:
             return None, "unparsable_date"
 
+        # Barclays formats where the real debit amount is embedded in the
+        # description (cash-machine "at 130.00 ..." and non-sterling FX
+        # rows whose trailing column carries only the fee). When detected,
+        # the inline amount replaces paid_out — balance_after stays as
+        # parsed from the trailing run.
+        inline_override = self._inline_amount_override(body_text)
+        inline_source: Optional[str] = None
+        if inline_override is not None:
+            inline_amount, inline_source = inline_override
+            paid_out = inline_amount
+            paid_in = 0.0
+
         amount_value = paid_in if paid_in > 0 else paid_out
         direction = "credit" if paid_in > 0 else "debit" if paid_out > 0 else "unknown"
 
@@ -1240,6 +1298,7 @@ class BarclaysStatementParser(BaseStatementParser):
             "source_line_end": None,
             "parser_adapter": self.parser_adapter,
             "confidence": 0.9,
+            "inline_amount_source": inline_source,
         }
         return transaction, None
 

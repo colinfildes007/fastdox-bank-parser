@@ -228,7 +228,7 @@ class BarclaysFixtureTests(unittest.TestCase):
     def test_health_lists_barclays_adapter(self):
         body = self.client.get("/health").json()
         self.assertIn("barclays_family_v1", body["available_adapters"])
-        self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.0.9")
+        self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.1.0")
 
     def test_barclays_grouped_dates_and_credit_phrases(self):
         """Real Barclays statements group several transactions under a single
@@ -320,7 +320,7 @@ class BarclaysFixtureTests(unittest.TestCase):
         debug = body["parser_debug"]
         self.assertIn("deterministic_run_id", debug)
         self.assertIn("page_processing_order", debug)
-        self.assertEqual(debug["adapter_version"], "1.0.9")
+        self.assertEqual(debug["adapter_version"], "1.1.0")
         self.assertEqual(debug["credit_rows_returned"], 3)
         self.assertEqual(debug["debit_rows_returned"], 3)
         self.assertEqual(debug["credit_amount_sum"], 5215.65)
@@ -758,6 +758,132 @@ class BarclaysFixtureTests(unittest.TestCase):
             self.assertIn("parsed_money_out", row)
             self.assertIn("parsed_balance", row)
             self.assertIn("rejection_reason", row)
+
+    def test_barclays_cash_machine_inline_amount(self):
+        """A Barclays cash-machine row carries the withdrawal amount inline
+        in the description ('Cash Machine Withdrawal at 130.00 Notemachine
+        Shell ...'). The amount column may carry a fee or the next row's
+        balance, so the parser must use the inline amount as paid_out.
+
+        Reproduces the £122.58 mismatch on page 10 of the real
+        Statement 18-aug-23 ac 13604152.PDF.
+        """
+        import fitz
+
+        lines = [
+            "Barclays Bank UK PLC",
+            "Your Barclays Bank Account statement",
+            "Current account statement",
+            "Sort Code 20-55-59  Account Number 13604152",
+            "Statement period: 15 Jun - 15 Jun 2023",
+            "At a glance",
+            "Start balance       £180.05",
+            "Money in            £0.00",
+            "Money out           £130.00",
+            "End balance         £50.05",
+            "Your transactions",
+            "15 Jun",
+            # The trailing 7.42 / 50.05 mimic the unreliable Money out /
+            # Balance column that pre-v1.1.0 was being picked as paid_out.
+            "Cash Machine Withdrawal at 130.00 Notemachine Shell Timed at On 15 Jun",
+            "7.42",
+            "50.05",
+        ]
+        info = ["Important information about your account"]
+
+        doc = fitz.open()
+        for block in (lines, info):
+            page = doc.new_page(width=720, height=80 + len(block) * 12 + 60)
+            y = 50
+            for line in block:
+                page.insert_text((40, y), line, fontsize=8)
+                y += 12
+
+        body = self._post_pdf(doc.write()).json()
+        self.assertEqual(body["status"], "success")
+        debug = body["parser_debug"]
+
+        cash = next(
+            (tx for tx in body["transactions"]
+             if "cash machine withdrawal" in tx["description_raw"].lower()),
+            None,
+        )
+        self.assertIsNotNone(cash, "Cash machine row missing")
+        self.assertEqual(cash["derived_transaction_type"], "cash_machine_withdrawal")
+        self.assertEqual(cash["paid_out"], 130.00)
+        self.assertEqual(cash["paid_in"], 0.0)
+        self.assertEqual(cash["inline_amount_source"], "cash_machine_inline")
+
+        # Reconciliation must close.
+        recon = body["reconciliation"]
+        self.assertEqual(recon["status"], "matched")
+        self.assertEqual(recon["calculated_total_debits"], 130.00)
+
+        # No balance mismatches remain on this fixture.
+        self.assertEqual(debug["balance_mismatch_rows"], [])
+
+    def test_barclays_non_sterling_fx_inline_gbp_amount(self):
+        """A Barclays non-sterling FX card payment carries the real GBP debit
+        inline in the description ('Card Payment to Curtis Technology 38.81
+        Nigeria USD 48.04 ... Final GBP Amount Includes A Non-Sterling
+        Transaction Fee of £...'). The trailing amount column carries only
+        the fee, so the parser must use the first inline money token as
+        paid_out.
+
+        Reproduces the £37.68 mismatch on page 16 of the real
+        Statement 18-aug-23 ac 13604152.PDF.
+        """
+        import fitz
+
+        lines = [
+            "Barclays Bank UK PLC",
+            "Your Barclays Bank Account statement",
+            "Current account statement",
+            "Sort Code 20-55-59  Account Number 13604152",
+            "Statement period: 09 Jul - 09 Jul 2023",
+            "At a glance",
+            "Start balance       £46.38",
+            "Money in            £0.00",
+            "Money out           £38.81",
+            "End balance         £7.57",
+            "Your transactions",
+            "09 Jul",
+            "Card Payment to Curtis Technology 38.81 Nigeria USD 48.04",
+            "On 09 Jul at VISA Exchange Rate 1.27",
+            "The Final GBP Amount Includes A Non-Sterling Transaction Fee of",
+            # Trailing column: pre-v1.1.0 would treat 1.13 as the debit and
+            # 7.57 as the balance, losing £37.68 of the real GBP movement.
+            "1.13",
+            "7.57",
+        ]
+        info = ["Important information about your account"]
+
+        doc = fitz.open()
+        for block in (lines, info):
+            page = doc.new_page(width=720, height=80 + len(block) * 12 + 60)
+            y = 50
+            for line in block:
+                page.insert_text((40, y), line, fontsize=8)
+                y += 12
+
+        body = self._post_pdf(doc.write()).json()
+        self.assertEqual(body["status"], "success")
+        debug = body["parser_debug"]
+
+        curtis = next(
+            (tx for tx in body["transactions"]
+             if "curtis technology" in tx["description_raw"].lower()),
+            None,
+        )
+        self.assertIsNotNone(curtis, "Curtis Technology row missing")
+        self.assertEqual(curtis["paid_out"], 38.81)
+        self.assertEqual(curtis["paid_in"], 0.0)
+        self.assertEqual(curtis["inline_amount_source"], "non_sterling_inline")
+
+        recon = body["reconciliation"]
+        self.assertEqual(recon["status"], "matched")
+        self.assertEqual(recon["calculated_total_debits"], 38.81)
+        self.assertEqual(debug["balance_mismatch_rows"], [])
 
     def test_barclays_detected_even_with_noisy_other_bank_mentions(self):
         """A bare 'santander' or 'lloyds' mention buried in a Barclays
