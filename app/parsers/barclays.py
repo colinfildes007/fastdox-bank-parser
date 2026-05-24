@@ -115,7 +115,7 @@ class BarclaysStatementParser(BaseStatementParser):
     bank_name = "Barclays"
     parser_name = "barclays_family_text_v1"
     parser_adapter = "barclays_family_v1"
-    adapter_version = "1.0.4"
+    adapter_version = "1.0.5"
 
     def can_parse(self, context: Dict) -> bool:
         hint = (context.get("bank_hint") or "").lower()
@@ -215,6 +215,73 @@ class BarclaysStatementParser(BaseStatementParser):
             if sample.get("reason") == "no_direction_for_single_amount"
         ]
 
+        # ---- delta + subset-sum diagnostics for reconciliation gaps ----
+        debit_delta = round(
+            (statement_total_debits or 0.0) - calculated_total_debits, 2
+        )
+        credit_delta = round(
+            (statement_total_credits or 0.0) - calculated_total_credits, 2
+        )
+
+        all_rejected = parse_debug["all_rejected"]
+        # Candidate pools: rejected rows whose derived_type was a credit/debit
+        # phrase OR that are unclassified (could be a missed transaction).
+        rejected_debit_pool = [
+            sample for sample in all_rejected
+            if sample.get("derived_type") in DEBIT_TYPES
+            or sample.get("derived_type") in (None, "unknown")
+        ]
+        rejected_credit_pool = [
+            sample for sample in all_rejected
+            if sample.get("derived_type") in CREDIT_TYPES
+        ]
+
+        candidate_rows_totalling_debit_delta = (
+            self._subsets_summing_to(rejected_debit_pool, debit_delta)
+            if abs(debit_delta) > 0.005 else []
+        )
+        candidate_rows_totalling_credit_delta = (
+            self._subsets_summing_to(rejected_credit_pool, credit_delta)
+            if abs(credit_delta) > 0.005 else []
+        )
+
+        # Rows where a debit amount might have been mis-attributed to
+        # balance_after — captured but with paid_out == 0 despite the row
+        # context not being a credit.
+        possible_debit_as_balance_rows = [
+            tx for tx in transactions
+            if float(tx.get("paid_in", 0.0) or 0.0) == 0.0
+            and float(tx.get("paid_out", 0.0) or 0.0) == 0.0
+            and tx.get("balance_after") not in (None, 0.0)
+        ]
+
+        # Per-page rejected debit/credit sums (first amount in each row).
+        per_page_rejected_debit_sums: Dict[str, float] = {}
+        per_page_rejected_credit_sums: Dict[str, float] = {}
+        for sample in all_rejected:
+            amounts = sample.get("amounts") or []
+            if not amounts:
+                continue
+            amount = amounts[0]
+            page_key = str(sample.get("page_number"))
+            derived = sample.get("derived_type")
+            if derived in DEBIT_TYPES or derived in (None, "unknown"):
+                per_page_rejected_debit_sums[page_key] = round(
+                    per_page_rejected_debit_sums.get(page_key, 0.0) + amount, 2
+                )
+            if derived in CREDIT_TYPES:
+                per_page_rejected_credit_sums[page_key] = round(
+                    per_page_rejected_credit_sums.get(page_key, 0.0) + amount, 2
+                )
+
+        rows_near_missing_debit = [
+            sample for sample in all_rejected
+            if any(
+                kw in sample.get("text", "").lower()
+                for kw in ("card payment", "direct debit", "transfer to", "cash machine", "card purchase", "bill payment to", "fee")
+            )
+        ][:25]
+
         statement = {
             "bank_name": self.bank_name,
             "account_holder": account_metadata.get("account_holder"),
@@ -295,12 +362,22 @@ class BarclaysStatementParser(BaseStatementParser):
             "calculated_total_credits_from_returned_transactions": calculated_total_credits,
             "calculated_total_debits_from_returned_transactions": calculated_total_debits,
             "duplicate_transaction_count": parse_debug["duplicate_count"],
+            "dedupe_removed_rows": parse_debug["duplicate_rows"],
             "per_page_transaction_counts": per_page_counts,
             "first_transaction": transactions[0] if transactions else None,
             "last_transaction": transactions[-1] if transactions else None,
             "first_5_transactions": transactions[:5],
             "last_5_transactions": transactions[-5:],
             "first_rejected_candidate_rows": parse_debug["first_rejected"],
+            "all_rejected_candidate_rows": parse_debug["all_rejected"],
+            "debit_delta": debit_delta,
+            "credit_delta": credit_delta,
+            "rows_near_missing_debit": rows_near_missing_debit,
+            "possible_debit_as_balance_rows": possible_debit_as_balance_rows,
+            "per_page_rejected_debit_sums": per_page_rejected_debit_sums,
+            "per_page_rejected_credit_sums": per_page_rejected_credit_sums,
+            "candidate_rows_totalling_debit_delta": candidate_rows_totalling_debit_delta,
+            "candidate_rows_totalling_credit_delta": candidate_rows_totalling_credit_delta,
         }
 
         response = self.build_response(context)
@@ -371,6 +448,7 @@ class BarclaysStatementParser(BaseStatementParser):
         pages_skipped: List[int] = []
         pages_with_rows: List[int] = []
         first_rejected: List[Dict] = []
+        all_rejected: List[Dict] = []
         missing_credit_examples: List[Dict] = []
         missing_debit_examples: List[Dict] = []
         debug = {
@@ -386,6 +464,7 @@ class BarclaysStatementParser(BaseStatementParser):
             "start_balance_seen": False,
             "end_balance_seen": False,
             "first_rejected": first_rejected,
+            "all_rejected": all_rejected,
             "missing_credit_examples": missing_credit_examples,
             "missing_debit_examples": missing_debit_examples,
             "rows_rejected_by_reason": {
@@ -395,6 +474,7 @@ class BarclaysStatementParser(BaseStatementParser):
                 "balance_marker": 0,
             },
             "duplicate_count": 0,
+            "duplicate_rows": [],
         }
 
         anchor_page = None
@@ -469,13 +549,18 @@ class BarclaysStatementParser(BaseStatementParser):
                     else:
                         debug["non_transaction_discarded"] += 1
 
+                    full_text = " ".join(row["lines"])
+                    money_in_text = MONEY_TOKEN.findall(full_text)
+                    parsed_amounts = [self._parse_money(token) for token in money_in_text]
                     sample = {
                         "page_number": page_number,
                         "row_index": row_index,
                         "reason": rejection or "unknown",
                         "derived_type": derived_type,
-                        "text": " ".join(row["lines"])[:200],
+                        "text": full_text[:200],
+                        "amounts": parsed_amounts,
                     }
+                    debug["all_rejected"].append(sample)
                     if len(first_rejected) < 15:
                         first_rejected.append(sample)
                     if derived_type in CREDIT_TYPES and len(missing_credit_examples) < 10:
@@ -801,7 +886,7 @@ class BarclaysStatementParser(BaseStatementParser):
         National Lottery, internal transfers) are kept."""
         seen = set()
         deduped: List[Dict] = []
-        removed = 0
+        removed_rows: List[Dict] = []
         for tx in transactions:
             key = (
                 tx.get("transaction_date"),
@@ -813,9 +898,47 @@ class BarclaysStatementParser(BaseStatementParser):
                 tx.get("row_index"),
             )
             if key in seen:
-                removed += 1
+                removed_rows.append(tx)
                 continue
             seen.add(key)
             deduped.append(tx)
-        debug["duplicate_count"] = removed
+        debug["duplicate_count"] = len(removed_rows)
+        debug["duplicate_rows"] = removed_rows
         return deduped, debug
+
+    @staticmethod
+    def _subsets_summing_to(
+        candidates: List[Dict],
+        target: float,
+        max_results: int = 3,
+        max_n: int = 18,
+        tolerance: float = 0.01,
+    ) -> List[List[Dict]]:
+        """Find subsets of ``candidates`` whose first amount sums to
+        ``target``. Bounded brute-force (2**max_n) so it cannot explode on
+        long rejection lists; returns up to ``max_results`` subsets."""
+        # Only consider candidates that contributed a sensible amount.
+        pool = [
+            (round(c["amounts"][0] * 100), c)
+            for c in candidates
+            if c.get("amounts")
+        ]
+        if not pool or abs(target) < tolerance:
+            return []
+        pool = pool[:max_n]
+        target_cents = round(abs(target) * 100)
+        tolerance_cents = max(1, round(tolerance * 100))
+        results: List[List[Dict]] = []
+        n = len(pool)
+        for mask in range(1, 1 << n):
+            total = 0
+            for i in range(n):
+                if mask & (1 << i):
+                    total += pool[i][0]
+            if abs(total - target_cents) <= tolerance_cents:
+                results.append(
+                    [pool[i][1] for i in range(n) if mask & (1 << i)]
+                )
+                if len(results) >= max_results:
+                    break
+        return results
