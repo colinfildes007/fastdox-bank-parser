@@ -228,7 +228,7 @@ class BarclaysFixtureTests(unittest.TestCase):
     def test_health_lists_barclays_adapter(self):
         body = self.client.get("/health").json()
         self.assertIn("barclays_family_v1", body["available_adapters"])
-        self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.0.7")
+        self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.0.8")
 
     def test_barclays_grouped_dates_and_credit_phrases(self):
         """Real Barclays statements group several transactions under a single
@@ -320,7 +320,7 @@ class BarclaysFixtureTests(unittest.TestCase):
         debug = body["parser_debug"]
         self.assertIn("deterministic_run_id", debug)
         self.assertIn("page_processing_order", debug)
-        self.assertEqual(debug["adapter_version"], "1.0.7")
+        self.assertEqual(debug["adapter_version"], "1.0.8")
         self.assertEqual(debug["credit_rows_returned"], 3)
         self.assertEqual(debug["debit_rows_returned"], 3)
         self.assertEqual(debug["credit_amount_sum"], 5215.65)
@@ -539,6 +539,81 @@ class BarclaysFixtureTests(unittest.TestCase):
         self.assertEqual(len(debug["transactions_matching_united_aluminium"]), 1)
         self.assertEqual(len(debug["transactions_matching_valerie"]), 1)
         self.assertGreaterEqual(len(debug["rejection_related_rows"]), 1)
+
+    def test_barclays_pdfplumber_bunched_amounts_are_redistributed(self):
+        """pdfplumber bunches consecutive same-phrase amounts on real Barclays
+        statements (Defect #2 / the £160.26 debit-gap regression). The first
+        row of the pair ends up with no money tokens and the second row
+        carries BOTH amounts. The parser must move the first amount back to
+        the empty row.
+
+        This reproduces the exact pattern observed on
+        Statement 18-aug-23 ac 13604152.PDF page 1 — Daniel Sherwood (no
+        amount) followed by Charlotte Latchfor (50.00, 75.00).
+        """
+        import fitz
+
+        lines = [
+            "Barclays Bank UK PLC",
+            "Your Barclays Bank Account statement",
+            "Current account statement",
+            "Sort Code 20-55-59  Account Number 13604152",
+            "Statement period: 26 May - 27 May 2023",
+            "At a glance",
+            "Start balance       £200.00",
+            "Money in            £0.00",
+            "Money out           £125.00",
+            "End balance         £75.00",
+            "Your transactions",
+            "26 May",
+            # Bunched-amounts pattern: Daniel has no money line, Charlotte
+            # carries 50.00 (Daniel's) AND 75.00 (Charlotte's).
+            "Bill Payment to Daniel Sherwood",
+            "Ref: Dad",
+            "Bill Payment to Charlotte Latchfor",
+            "Ref: PS",
+            "50.00",
+            "75.00",
+        ]
+        info = ["Important information about your account"]
+
+        doc = fitz.open()
+        for block in (lines, info):
+            page = doc.new_page(width=720, height=80 + len(block) * 12 + 60)
+            y = 50
+            for line in block:
+                page.insert_text((40, y), line, fontsize=8)
+                y += 12
+
+        body = self._post_pdf(doc.write()).json()
+        self.assertEqual(body["status"], "success")
+
+        by_payee = {
+            tx["description_raw"].split("Ref:")[0].strip(): tx
+            for tx in body["transactions"]
+        }
+        # Both rows must be present.
+        self.assertIn("Bill Payment to Daniel Sherwood", by_payee)
+        self.assertIn("Bill Payment to Charlotte Latchfor", by_payee)
+
+        daniel = by_payee["Bill Payment to Daniel Sherwood"]
+        charlotte = by_payee["Bill Payment to Charlotte Latchfor"]
+        self.assertEqual(daniel["paid_out"], 50.00)
+        self.assertEqual(daniel["paid_in"], 0.0)
+        self.assertEqual(charlotte["paid_out"], 75.00)
+        self.assertEqual(charlotte["paid_in"], 0.0)
+
+        # Totals must reconcile to the statement header (200 - 125 = 75).
+        recon = body["reconciliation"]
+        self.assertEqual(recon["status"], "matched")
+        self.assertEqual(recon["calculated_total_debits"], 125.00)
+
+        debug = body["parser_debug"]
+        self.assertIn("bunched_redistributions", debug)
+        self.assertEqual(len(debug["bunched_redistributions"]), 1)
+        move = debug["bunched_redistributions"][0]
+        self.assertEqual(move["borrowed_amount"], "50.00")
+        self.assertEqual(move["phrase"], "bill payment to")
 
     def test_barclays_detected_even_with_noisy_other_bank_mentions(self):
         """A bare 'santander' or 'lloyds' mention buried in a Barclays

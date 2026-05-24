@@ -168,7 +168,7 @@ class BarclaysStatementParser(BaseStatementParser):
     bank_name = "Barclays"
     parser_name = "barclays_family_text_v1"
     parser_adapter = "barclays_family_v1"
-    adapter_version = "1.0.7"
+    adapter_version = "1.0.8"
 
     def can_parse(self, context: Dict) -> bool:
         hint = (context.get("bank_hint") or "").lower()
@@ -462,6 +462,7 @@ class BarclaysStatementParser(BaseStatementParser):
             "candidate_rows_totalling_debit_delta": candidate_rows_totalling_debit_delta,
             "candidate_rows_totalling_credit_delta": candidate_rows_totalling_credit_delta,
             "orphan_lines_with_money": orphan_lines,
+            "bunched_redistributions": parse_debug.get("bunched_redistributions", []),
         }
 
         response = self.build_response(context)
@@ -560,6 +561,7 @@ class BarclaysStatementParser(BaseStatementParser):
             "duplicate_count": 0,
             "duplicate_rows": [],
             "orphan_lines": [],
+            "bunched_redistributions": [],
         }
 
         anchor_page = None
@@ -618,6 +620,10 @@ class BarclaysStatementParser(BaseStatementParser):
             rows, carried_date_text = self._extract_rows(
                 section_text, carried_date_text, page_orphans
             )
+            redistributions = self._redistribute_bunched_amounts(rows)
+            for move in redistributions:
+                move["page_number"] = page_number
+                debug["bunched_redistributions"].append(move)
             for orphan in page_orphans:
                 orphan["page_number"] = page_number
                 debug["orphan_lines"].append(orphan)
@@ -802,6 +808,83 @@ class BarclaysStatementParser(BaseStatementParser):
             rows.append(current_row)
 
         return rows, current_date_text
+
+    def _redistribute_bunched_amounts(self, rows: List[Dict]) -> List[Dict]:
+        """Repair pdfplumber-bunched amounts.
+
+        pdfplumber's text extraction sometimes carries the amount of one
+        transaction past the next transaction's description, so two
+        consecutive same-phrase rows end up with the first row carrying
+        zero money tokens and the second carrying both rows' amounts.
+        Example (from the real Statement 18-aug-23 ac 13604152.PDF):
+
+            Bill Payment to Daniel Sherwood
+            Ref: Dad
+            Bill Payment to Charlotte Latchfor
+            Ref: PS
+            50.00      <- actually Daniel's amount
+            75.00      <- actually Charlotte's amount
+
+        Heuristic: when row N has no money tokens and row N+1 has the same
+        transaction phrase and 2+ money tokens, the first money token in
+        row N+1 belongs to row N — move it back. The same-phrase guard
+        keeps this from disturbing legitimate amount+balance pairs (which
+        belong to a single row, not two).
+
+        Returns a list of {borrowed_amount, from_row_index, to_row_index}
+        records so the redistribution is auditable from parser_debug.
+        """
+        moves: List[Dict] = []
+        if not rows:
+            return moves
+
+        def collect_money(row):
+            collected = []
+            for line_index, line in enumerate(row.get("lines", [])):
+                for match in MONEY_TOKEN.finditer(line):
+                    collected.append((line_index, match.group(0), match.start(), match.end()))
+            return collected
+
+        def row_phrase(row):
+            lines = row.get("lines") or []
+            if not lines:
+                return None
+            return self._match_transaction_phrase(lines[0])
+
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(rows) - 1):
+                row = rows[i]
+                next_row = rows[i + 1]
+                if collect_money(row):
+                    continue
+                next_money = collect_money(next_row)
+                if len(next_money) < 2:
+                    continue
+                row_p = row_phrase(row)
+                next_p = row_phrase(next_row)
+                if row_p is None or row_p != next_p:
+                    continue
+                line_index, token, start, end = next_money[0]
+                line = next_row["lines"][line_index]
+                new_line = (line[:start] + line[end:]).strip()
+                if new_line:
+                    next_row["lines"][line_index] = new_line
+                else:
+                    next_row["lines"].pop(line_index)
+                row["lines"].append(token)
+                moves.append(
+                    {
+                        "borrowed_amount": token,
+                        "from_row_index": i + 1,
+                        "to_row_index": i,
+                        "phrase": row_p,
+                    }
+                )
+                changed = True
+                break  # restart the scan after a mutation
+        return moves
 
     def _is_rejection_split_trigger(self, content: str) -> bool:
         lower = content.lower().strip()
