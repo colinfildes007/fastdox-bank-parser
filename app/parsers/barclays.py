@@ -56,6 +56,26 @@ TRANSACTION_TYPE_PATTERNS = [
     (re.compile(r"received\s+from", re.IGNORECASE), "received_from"),
     (re.compile(r"transfer\s+from", re.IGNORECASE), "transfer_from"),
     (re.compile(r"transfer\s+to", re.IGNORECASE), "transfer_to"),
+    # Additional Barclays phrases (1.0.7 — debit-gap diagnostic widening).
+    (re.compile(r"standing\s+order\s+to", re.IGNORECASE), "standing_order_to"),
+    (re.compile(r"standing\s+order\s+from", re.IGNORECASE), "standing_order_from"),
+    (re.compile(r"standing\s+order", re.IGNORECASE), "standing_order"),
+    (re.compile(r"bacs\s+payment\s+to", re.IGNORECASE), "bacs_payment_to"),
+    (re.compile(r"bacs\s+payment\s+from", re.IGNORECASE), "bacs_payment_from"),
+    (re.compile(r"bacs\s+credit", re.IGNORECASE), "bacs_credit"),
+    (re.compile(r"bacs\s+payment", re.IGNORECASE), "bacs_payment"),
+    (re.compile(r"\batm\s+withdrawal\b", re.IGNORECASE), "atm_withdrawal"),
+    (re.compile(r"\bcashpoint\b", re.IGNORECASE), "cashpoint"),
+    (re.compile(r"non[\-\s]?sterling\s+(?:transaction\s+)?fee", re.IGNORECASE), "non_sterling_fee"),
+    (re.compile(r"foreign\s+currency\s+fee", re.IGNORECASE), "foreign_currency_fee"),
+    (re.compile(r"overdraft\s+fee", re.IGNORECASE), "overdraft_fee"),
+    (re.compile(r"bank\s+charge", re.IGNORECASE), "bank_charge"),
+    (re.compile(r"service\s+charge", re.IGNORECASE), "service_charge"),
+    (re.compile(r"unpaid\s+(?:item|cheque)", re.IGNORECASE), "unpaid_item"),
+    (re.compile(r"returned\s+cheque", re.IGNORECASE), "returned_cheque"),
+    (re.compile(r"cheque\s+paid", re.IGNORECASE), "cheque_paid"),
+    (re.compile(r"interest\s+charged", re.IGNORECASE), "interest_charged"),
+    (re.compile(r"interest\s+paid", re.IGNORECASE), "interest_paid"),
     # Generic credit indicators — last so they only fire on rows without an
     # explicit phrase prefix.
     (re.compile(r"\brejection\b", re.IGNORECASE), "rejection"),
@@ -80,16 +100,49 @@ TRANSACTION_PHRASES = [
     "received from",
     "start balance",
     "end balance",
+    # Additional Barclays row-starting phrases (1.0.7).
+    "standing order to",
+    "standing order from",
+    "standing order",
+    "bacs payment to",
+    "bacs payment from",
+    "bacs payment",
+    "bacs credit",
+    "atm withdrawal",
+    "cashpoint",
+    "non-sterling transaction fee",
+    "non sterling transaction fee",
+    "non-sterling fee",
+    "non sterling fee",
+    "foreign currency fee",
+    "overdraft fee",
+    "bank charge",
+    "service charge",
+    "unpaid item",
+    "unpaid cheque",
+    "returned cheque",
+    "cheque paid",
+    "interest charged",
+    "interest paid",
 ]
 
 CREDIT_TYPES = {
     "received_from", "transfer_from", "bill_payment_from",
+    "standing_order_from", "bacs_payment_from", "bacs_credit",
+    "interest_paid",
     # rejected outbound payments come back as money in -> credit.
     "rejection", "refund", "reversal",
 }
 DEBIT_TYPES = {
     "card_payment", "card_purchase", "bill_payment", "bill_payment_to",
     "transfer_to", "direct_debit", "cash_machine_withdrawal",
+    "standing_order_to", "standing_order",
+    "bacs_payment_to", "bacs_payment",
+    "atm_withdrawal", "cashpoint",
+    "non_sterling_fee", "foreign_currency_fee", "overdraft_fee",
+    "bank_charge", "service_charge",
+    "unpaid_item", "returned_cheque", "cheque_paid",
+    "interest_charged",
 }
 BALANCE_MARKER_TYPES = {"start_balance", "end_balance"}
 
@@ -115,7 +168,7 @@ class BarclaysStatementParser(BaseStatementParser):
     bank_name = "Barclays"
     parser_name = "barclays_family_text_v1"
     parser_adapter = "barclays_family_v1"
-    adapter_version = "1.0.6"
+    adapter_version = "1.0.7"
 
     def can_parse(self, context: Dict) -> bool:
         hint = (context.get("bank_hint") or "").lower()
@@ -232,13 +285,26 @@ class BarclaysStatementParser(BaseStatementParser):
         )
 
         all_rejected = parse_debug["all_rejected"]
+        orphan_lines = parse_debug["orphan_lines"]
         # Candidate pools: rejected rows whose derived_type was a credit/debit
-        # phrase OR that are unclassified (could be a missed transaction).
+        # phrase OR that are unclassified, PLUS orphan lines (lines with a
+        # money token that never became a row — typically a missing debit).
+        orphans_as_candidates = [
+            {
+                "page_number": orphan.get("page_number"),
+                "row_index": None,
+                "reason": "orphan_line_with_money",
+                "derived_type": None,
+                "text": orphan.get("text"),
+                "amounts": orphan.get("amounts") or [],
+            }
+            for orphan in orphan_lines
+        ]
         rejected_debit_pool = [
             sample for sample in all_rejected
             if sample.get("derived_type") in DEBIT_TYPES
             or sample.get("derived_type") in (None, "unknown")
-        ]
+        ] + orphans_as_candidates
         rejected_credit_pool = [
             sample for sample in all_rejected
             if sample.get("derived_type") in CREDIT_TYPES
@@ -395,6 +461,7 @@ class BarclaysStatementParser(BaseStatementParser):
             "per_page_rejected_credit_sums": per_page_rejected_credit_sums,
             "candidate_rows_totalling_debit_delta": candidate_rows_totalling_debit_delta,
             "candidate_rows_totalling_credit_delta": candidate_rows_totalling_credit_delta,
+            "orphan_lines_with_money": orphan_lines,
         }
 
         response = self.build_response(context)
@@ -492,6 +559,7 @@ class BarclaysStatementParser(BaseStatementParser):
             },
             "duplicate_count": 0,
             "duplicate_rows": [],
+            "orphan_lines": [],
         }
 
         anchor_page = None
@@ -546,7 +614,13 @@ class BarclaysStatementParser(BaseStatementParser):
 
             pages_considered.append(page_number)
 
-            rows, carried_date_text = self._extract_rows(section_text, carried_date_text)
+            page_orphans: List[Dict] = []
+            rows, carried_date_text = self._extract_rows(
+                section_text, carried_date_text, page_orphans
+            )
+            for orphan in page_orphans:
+                orphan["page_number"] = page_number
+                debug["orphan_lines"].append(orphan)
             page_rows: List[Dict] = []
             for row_index, row in enumerate(rows, start=1):
                 debug["candidate_rows"] += 1
@@ -637,6 +711,7 @@ class BarclaysStatementParser(BaseStatementParser):
         self,
         section_text: str,
         carried_date_text: Optional[str],
+        orphan_lines: Optional[List[Dict]] = None,
     ) -> Tuple[List[Dict], Optional[str]]:
         """Build transaction rows from a section of statement text.
 
@@ -706,6 +781,22 @@ class BarclaysStatementParser(BaseStatementParser):
 
             if current_row is not None:
                 current_row["lines"].append(content)
+            elif orphan_lines is not None and MONEY_TOKEN.search(content):
+                # A line with a money token that did not start a row (no
+                # phrase) and has no row to continue. These are the lines
+                # most likely to hide a missing debit — the row-extractor
+                # cannot see them otherwise.
+                amounts = [
+                    self._parse_money(token)
+                    for token in MONEY_TOKEN.findall(content)
+                ]
+                orphan_lines.append(
+                    {
+                        "text": content[:200],
+                        "amounts": amounts,
+                        "carried_date_text": current_date_text,
+                    }
+                )
 
         if current_row is not None:
             rows.append(current_row)

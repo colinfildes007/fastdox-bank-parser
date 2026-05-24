@@ -228,7 +228,7 @@ class BarclaysFixtureTests(unittest.TestCase):
     def test_health_lists_barclays_adapter(self):
         body = self.client.get("/health").json()
         self.assertIn("barclays_family_v1", body["available_adapters"])
-        self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.0.6")
+        self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.0.7")
 
     def test_barclays_grouped_dates_and_credit_phrases(self):
         """Real Barclays statements group several transactions under a single
@@ -320,7 +320,7 @@ class BarclaysFixtureTests(unittest.TestCase):
         debug = body["parser_debug"]
         self.assertIn("deterministic_run_id", debug)
         self.assertIn("page_processing_order", debug)
-        self.assertEqual(debug["adapter_version"], "1.0.6")
+        self.assertEqual(debug["adapter_version"], "1.0.7")
         self.assertEqual(debug["credit_rows_returned"], 3)
         self.assertEqual(debug["debit_rows_returned"], 3)
         self.assertEqual(debug["credit_amount_sum"], 5215.65)
