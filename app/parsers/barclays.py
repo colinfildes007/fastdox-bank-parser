@@ -168,7 +168,7 @@ class BarclaysStatementParser(BaseStatementParser):
     bank_name = "Barclays"
     parser_name = "barclays_family_text_v1"
     parser_adapter = "barclays_family_v1"
-    adapter_version = "1.0.8"
+    adapter_version = "1.0.9"
 
     def can_parse(self, context: Dict) -> bool:
         hint = (context.get("bank_hint") or "").lower()
@@ -356,6 +356,94 @@ class BarclaysStatementParser(BaseStatementParser):
             )
         ][:25]
 
+        # ---- balance chain (emitted + rejected, in document order) ----
+        # For every emitted or rejected candidate row, project the running
+        # balance: expected_balance_after = previous_balance + paid_in
+        # - paid_out, with balance_delta against the parsed value. This is
+        # the diagnostic that surfaces a missing row even when its amount
+        # was parsed into the wrong column or the row was dropped before
+        # becoming a transaction.
+        emitted_entries = [
+            {
+                "kind": "emitted",
+                "page_number": tx.get("page_number"),
+                "row_index": tx.get("row_index"),
+                "transaction_date": tx.get("transaction_date"),
+                "description": tx.get("description_clean"),
+                "paid_in": float(tx.get("paid_in") or 0.0),
+                "paid_out": float(tx.get("paid_out") or 0.0),
+                "parsed_balance_after": tx.get("balance_after"),
+            }
+            for tx in transactions
+        ]
+        rejected_entries = [
+            {
+                "kind": "rejected",
+                "page_number": sample.get("page_number"),
+                "row_index": sample.get("row_index"),
+                "transaction_date": sample.get("parsed_date"),
+                "description": sample.get("parsed_description"),
+                "paid_in": float(sample.get("parsed_money_in") or 0.0),
+                "paid_out": float(sample.get("parsed_money_out") or 0.0),
+                "parsed_balance_after": sample.get("parsed_balance"),
+                "rejection_reason": sample.get("rejection_reason"),
+            }
+            for sample in all_rejected
+        ]
+        combined = sorted(
+            emitted_entries + rejected_entries,
+            key=lambda entry: (
+                entry.get("page_number") or 0,
+                entry.get("row_index") or 0,
+            ),
+        )
+        balance_chain: List[Dict] = []
+        running_balance: Optional[float] = opening_balance
+        for entry in combined:
+            paid_in = entry["paid_in"]
+            paid_out = entry["paid_out"]
+            parsed_balance = entry.get("parsed_balance_after")
+            expected = (
+                round((running_balance or 0.0) + paid_in - paid_out, 2)
+                if running_balance is not None else None
+            )
+            delta = (
+                round(expected - parsed_balance, 2)
+                if expected is not None and parsed_balance is not None
+                else None
+            )
+            chain_entry = {
+                "kind": entry["kind"],
+                "page_number": entry.get("page_number"),
+                "row_index": entry.get("row_index"),
+                "transaction_date": entry.get("transaction_date"),
+                "description": entry.get("description"),
+                "previous_balance": running_balance,
+                "paid_in": paid_in,
+                "paid_out": paid_out,
+                "parsed_balance_after": parsed_balance,
+                "expected_balance_after": expected,
+                "balance_delta": delta,
+            }
+            if entry["kind"] == "rejected":
+                chain_entry["rejection_reason"] = entry.get("rejection_reason")
+            balance_chain.append(chain_entry)
+            # Only emitted rows advance the chain so a single dropped row
+            # doesn't compound into every subsequent comparison.
+            if entry["kind"] == "emitted":
+                if parsed_balance is not None:
+                    running_balance = parsed_balance
+                elif expected is not None:
+                    running_balance = expected
+
+        # Rows whose parsed balance disagrees with the projected balance —
+        # the leading suspect when reconciliation is short by a single amount.
+        balance_mismatch_rows = [
+            entry for entry in balance_chain
+            if entry.get("balance_delta") is not None
+            and abs(entry["balance_delta"]) > 0.005
+        ]
+
         statement = {
             "bank_name": self.bank_name,
             "account_holder": account_metadata.get("account_holder"),
@@ -419,8 +507,12 @@ class BarclaysStatementParser(BaseStatementParser):
             "debit_amount_sum": calculated_total_debits,
             "missing_credit_examples": parse_debug["missing_credit_examples"],
             "missing_debit_examples": parse_debug["missing_debit_examples"],
-            "rejected_credit_candidates": parse_debug["missing_credit_examples"],
-            "rejected_debit_candidates": parse_debug["missing_debit_examples"],
+            # The full superset of rejections — never narrowed by derived
+            # type, because a derived_type of "unknown" was previously
+            # excluding silent debit drops from these arrays.
+            "rejected_rows": parse_debug["all_rejected"],
+            "rejected_credit_candidates": parse_debug["all_rejected"],
+            "rejected_debit_candidates": parse_debug["all_rejected"],
             "ambiguous_amount_rows": ambiguous_amount_rows,
             "rows_near_missing_credit": rows_near_missing_credit,
             "transactions_on_2023_05_26": transactions_on_2023_05_26,
@@ -463,6 +555,8 @@ class BarclaysStatementParser(BaseStatementParser):
             "candidate_rows_totalling_credit_delta": candidate_rows_totalling_credit_delta,
             "orphan_lines_with_money": orphan_lines,
             "bunched_redistributions": parse_debug.get("bunched_redistributions", []),
+            "balance_chain": balance_chain,
+            "balance_mismatch_rows": balance_mismatch_rows,
         }
 
         response = self.build_response(context)
@@ -628,6 +722,9 @@ class BarclaysStatementParser(BaseStatementParser):
                 orphan["page_number"] = page_number
                 debug["orphan_lines"].append(orphan)
             page_rows: List[Dict] = []
+            # Rejection samples on this page that still need next_emitted_row
+            # populated — backfilled as soon as the next emission happens.
+            pending_next_emitted: List[Dict] = []
             for row_index, row in enumerate(rows, start=1):
                 debug["candidate_rows"] += 1
                 transaction, rejection = self._build_transaction(
@@ -656,18 +753,32 @@ class BarclaysStatementParser(BaseStatementParser):
                     else:
                         debug["non_transaction_discarded"] += 1
 
+                    # Best-effort field parsing so rejected rows are not opaque.
+                    diagnose = self._diagnose_row(row, start_date, end_date)
                     full_text = " ".join(row["lines"])
-                    money_in_text = MONEY_TOKEN.findall(full_text)
-                    parsed_amounts = [self._parse_money(token) for token in money_in_text]
                     sample = {
                         "page_number": page_number,
                         "row_index": row_index,
+                        "candidate_index": row_index,
                         "reason": rejection or "unknown",
+                        "rejection_reason": rejection or "unknown",
                         "derived_type": derived_type,
+                        "parsed_derived_type": diagnose["parsed_derived_type"],
                         "text": full_text[:200],
-                        "amounts": parsed_amounts,
+                        "raw_text": full_text,
+                        "parsed_date": diagnose["parsed_date"],
+                        "parsed_description": diagnose["parsed_description"],
+                        "parsed_money_in": diagnose["parsed_money_in"],
+                        "parsed_money_out": diagnose["parsed_money_out"],
+                        "parsed_balance": diagnose["parsed_balance"],
+                        "amounts": diagnose["money_values_all"],
+                        "previous_emitted_row": (
+                            self._row_snapshot(page_rows[-1]) if page_rows else None
+                        ),
+                        "next_emitted_row": None,
                     }
                     debug["all_rejected"].append(sample)
+                    pending_next_emitted.append(sample)
                     if len(first_rejected) < 15:
                         first_rejected.append(sample)
                     if derived_type in CREDIT_TYPES and len(missing_credit_examples) < 10:
@@ -678,6 +789,12 @@ class BarclaysStatementParser(BaseStatementParser):
 
                 debug["date_matches"] += 1
                 page_rows.append(transaction)
+                # Backfill next_emitted_row on every rejection waiting for one.
+                if pending_next_emitted:
+                    snapshot = self._row_snapshot(transaction)
+                    for pending in pending_next_emitted:
+                        pending["next_emitted_row"] = snapshot
+                    pending_next_emitted.clear()
 
             if page_rows:
                 pages_with_rows.append(page_number)
@@ -923,6 +1040,96 @@ class BarclaysStatementParser(BaseStatementParser):
             if lower.startswith(phrase):
                 return phrase
         return None
+
+    def _diagnose_row(
+        self,
+        row: Dict,
+        start_date: Optional[str],
+        end_date: Optional[str],
+    ) -> Dict:
+        """Best-effort field extraction for any candidate row — used to enrich
+        rejected-row reports so that the parsed date / description / money
+        columns are visible in parser_debug even when the row was dropped."""
+        joined = " ".join(row.get("lines") or [])
+        all_matches = list(MONEY_TOKEN.finditer(joined))
+        money_values_all = [self._parse_money(m.group(0)) for m in all_matches]
+
+        if all_matches:
+            runs: List[List["re.Match[str]"]] = []
+            current_run: List["re.Match[str]"] = []
+            for match in all_matches:
+                if not current_run:
+                    current_run = [match]
+                elif joined[current_run[-1].end():match.start()].strip() == "":
+                    current_run.append(match)
+                else:
+                    runs.append(current_run)
+                    current_run = [match]
+            if current_run:
+                runs.append(current_run)
+            if all(len(run) == 1 for run in runs):
+                amounts_run = runs[-1]
+            else:
+                amounts_run = max(runs, key=len)
+            if len(amounts_run) > 3:
+                amounts_run = amounts_run[-3:]
+            amounts_start = amounts_run[0].start()
+            amounts_end = amounts_run[-1].end()
+            description = joined[:amounts_start] + " " + joined[amounts_end:]
+            run_values = [self._parse_money(m.group(0)) for m in amounts_run]
+        else:
+            description = joined
+            run_values = []
+
+        description = re.sub(r"\s{2,}", " ", description).strip(" ,;-.")
+        derived_type = self._derive_transaction_type(description)
+
+        paid_in = 0.0
+        paid_out = 0.0
+        balance_after: Optional[float] = None
+        if len(run_values) >= 3:
+            paid_out, paid_in, balance_after = run_values[-3], run_values[-2], run_values[-1]
+        elif len(run_values) == 2:
+            balance_after = run_values[-1]
+            amt = run_values[-2]
+            if derived_type in CREDIT_TYPES:
+                paid_in = amt
+            elif derived_type in DEBIT_TYPES:
+                paid_out = amt
+            else:
+                paid_out = amt
+        elif len(run_values) == 1:
+            amt = run_values[0]
+            if derived_type in CREDIT_TYPES:
+                paid_in = amt
+            elif derived_type in DEBIT_TYPES:
+                paid_out = amt
+
+        parsed_date = self._parse_date(row.get("date_text"), start_date, end_date)
+        return {
+            "parsed_date": parsed_date,
+            "parsed_description": description,
+            "parsed_derived_type": derived_type,
+            "money_values_all": money_values_all,
+            "amounts_run_values": run_values,
+            "parsed_money_in": round(paid_in, 2),
+            "parsed_money_out": round(paid_out, 2),
+            "parsed_balance": round(balance_after, 2) if balance_after is not None else None,
+        }
+
+    @staticmethod
+    def _row_snapshot(tx: Dict) -> Dict:
+        """Compact view of an emitted transaction — used as the
+        previous_emitted_row / next_emitted_row context on rejection records."""
+        return {
+            "row_index": tx.get("row_index"),
+            "page_number": tx.get("page_number"),
+            "transaction_date": tx.get("transaction_date"),
+            "description": tx.get("description_clean"),
+            "paid_in": tx.get("paid_in"),
+            "paid_out": tx.get("paid_out"),
+            "balance_after": tx.get("balance_after"),
+        }
 
     def _build_transaction(
         self,

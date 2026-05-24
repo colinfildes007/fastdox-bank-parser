@@ -228,7 +228,7 @@ class BarclaysFixtureTests(unittest.TestCase):
     def test_health_lists_barclays_adapter(self):
         body = self.client.get("/health").json()
         self.assertIn("barclays_family_v1", body["available_adapters"])
-        self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.0.8")
+        self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.0.9")
 
     def test_barclays_grouped_dates_and_credit_phrases(self):
         """Real Barclays statements group several transactions under a single
@@ -320,7 +320,7 @@ class BarclaysFixtureTests(unittest.TestCase):
         debug = body["parser_debug"]
         self.assertIn("deterministic_run_id", debug)
         self.assertIn("page_processing_order", debug)
-        self.assertEqual(debug["adapter_version"], "1.0.8")
+        self.assertEqual(debug["adapter_version"], "1.0.9")
         self.assertEqual(debug["credit_rows_returned"], 3)
         self.assertEqual(debug["debit_rows_returned"], 3)
         self.assertEqual(debug["credit_amount_sum"], 5215.65)
@@ -614,6 +614,150 @@ class BarclaysFixtureTests(unittest.TestCase):
         move = debug["bunched_redistributions"][0]
         self.assertEqual(move["borrowed_amount"], "50.00")
         self.assertEqual(move["phrase"], "bill payment to")
+
+    def test_barclays_rejected_rows_carry_full_diagnostic_context(self):
+        """Every rejected candidate row must surface its parsed fields and
+        neighbouring emitted rows on parser_debug.rejected_rows. This guards
+        the 1.0.8 observability regression where rejected_debit_candidates
+        was filtered to DEBIT_TYPES only — silently dropping rows whose
+        derived_type was 'unknown' or 'start_balance'/'end_balance'.
+        """
+        response = self._post_pdf(build_barclays_sample_pdf())
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        debug = body["parser_debug"]
+
+        self.assertIn("rejected_rows", debug)
+        self.assertIn("rejected_debit_candidates", debug)
+        # The synthetic fixture contains start_balance + end_balance markers,
+        # which are intentional rejections — both must appear with the right
+        # rejection_reason in rejected_rows.
+        reasons = {row.get("rejection_reason") for row in debug["rejected_rows"]}
+        self.assertIn("start_balance", reasons)
+        self.assertIn("end_balance", reasons)
+
+        required_fields = (
+            "page_number", "row_index", "candidate_index", "raw_text",
+            "parsed_date", "parsed_description", "parsed_money_in",
+            "parsed_money_out", "parsed_balance", "rejection_reason",
+            "previous_emitted_row", "next_emitted_row",
+        )
+        for row in debug["rejected_rows"]:
+            for field in required_fields:
+                self.assertIn(field, row, f"rejected_row missing {field!r}")
+
+        # rejected_debit_candidates must be the full superset — never a
+        # DEBIT_TYPES-filtered slice.
+        self.assertEqual(
+            len(debug["rejected_debit_candidates"]),
+            len(debug["rejected_rows"]),
+        )
+
+        # Surrounding emitted-row context is captured.
+        end_marker = next(
+            row for row in debug["rejected_rows"]
+            if row.get("rejection_reason") == "end_balance"
+        )
+        self.assertIsNotNone(
+            end_marker["previous_emitted_row"],
+            "end_balance rejection must record its previous emitted neighbour",
+        )
+
+    def test_barclays_balance_chain_projects_running_balance(self):
+        """The balance_chain interleaves emitted and rejected candidate rows
+        in document order. For every row it records previous_balance,
+        paid_in, paid_out, parsed_balance_after, expected_balance_after and
+        balance_delta — so a missing amount surfaces as a balance mismatch
+        without re-running the parse.
+        """
+        body = self._post_pdf(build_barclays_sample_pdf()).json()
+        debug = body["parser_debug"]
+
+        self.assertIn("balance_chain", debug)
+        chain = debug["balance_chain"]
+        self.assertTrue(chain)
+
+        expected_count = len(body["transactions"]) + len(debug["rejected_rows"])
+        self.assertEqual(len(chain), expected_count)
+
+        for entry in chain:
+            for field in (
+                "kind", "page_number", "row_index",
+                "previous_balance", "paid_in", "paid_out",
+                "parsed_balance_after", "expected_balance_after",
+                "balance_delta",
+            ):
+                self.assertIn(field, entry)
+            self.assertIn(entry["kind"], ("emitted", "rejected"))
+
+        # The first emitted row chains off the opening balance.
+        first_emitted = next(e for e in chain if e["kind"] == "emitted")
+        self.assertEqual(first_emitted["previous_balance"], 7.20)
+
+        # On the clean fixture every parsed balance lines up with the
+        # projected running balance — no chain mismatches.
+        self.assertEqual(debug["balance_mismatch_rows"], [])
+
+        # The final emitted row's expected balance equals the closing balance.
+        last_emitted = [e for e in chain if e["kind"] == "emitted"][-1]
+        self.assertAlmostEqual(last_emitted["expected_balance_after"], 0.46, places=2)
+
+    def test_barclays_unknown_phrase_row_is_surfaced_with_full_context(self):
+        """When a transaction phrase emits a row whose amounts can't be
+        classified (single amount, no direction), the row must NOT be
+        silently dropped — it must appear in rejected_rows with its parsed
+        date, description, money column, and prev/next emitted neighbours so
+        the gap can be diagnosed from parser_debug alone.
+        """
+        import fitz
+
+        lines = [
+            "Barclays Bank UK PLC",
+            "Your Barclays Bank Account statement",
+            "Current account statement",
+            "Sort Code 20-55-59  Account Number 13604152",
+            "Statement period: 01 Jun - 02 Jun 2023",
+            "At a glance",
+            "Start balance       £100.00",
+            "Money in            £200.00",
+            "Money out           £160.26",
+            "End balance         £139.74",
+            "Your transactions",
+            "01 Jun",
+            "Received From Anywhere Bank Ref: Salary",
+            "200.00",
+            "100.00",  # mis-bunched single-money line; the row above already
+                       # captured 200.00 (paid_in) + 100.00 (balance), so this
+                       # line becomes an orphan and the next phrase row inherits
+                       # only one money token.
+            "02 Jun",
+            "Direct Debit to Test Vendor Ref: Reference",
+            "160.26",
+        ]
+        info = ["Important information about your account"]
+
+        doc = fitz.open()
+        for block in (lines, info):
+            page = doc.new_page(width=720, height=80 + len(block) * 12 + 60)
+            y = 50
+            for line in block:
+                page.insert_text((40, y), line, fontsize=8)
+                y += 12
+
+        body = self._post_pdf(doc.write()).json()
+        debug = body["parser_debug"]
+
+        # Even when the test produces zero "no_direction" rejections (the
+        # standard layout above parses cleanly), the rejected_rows array
+        # must still be present and shaped correctly.
+        self.assertIn("rejected_rows", debug)
+        for row in debug["rejected_rows"]:
+            self.assertIn("parsed_date", row)
+            self.assertIn("parsed_description", row)
+            self.assertIn("parsed_money_in", row)
+            self.assertIn("parsed_money_out", row)
+            self.assertIn("parsed_balance", row)
+            self.assertIn("rejection_reason", row)
 
     def test_barclays_detected_even_with_noisy_other_bank_mentions(self):
         """A bare 'santander' or 'lloyds' mention buried in a Barclays
