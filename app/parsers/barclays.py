@@ -168,7 +168,7 @@ class BarclaysStatementParser(BaseStatementParser):
     bank_name = "Barclays"
     parser_name = "barclays_family_text_v1"
     parser_adapter = "barclays_family_v1"
-    adapter_version = "1.1.0"
+    adapter_version = "1.1.1"
 
     def can_parse(self, context: Dict) -> bool:
         hint = (context.get("bank_hint") or "").lower()
@@ -1041,21 +1041,13 @@ class BarclaysStatementParser(BaseStatementParser):
                 return phrase
         return None
 
-    # Withdrawal amount embedded directly in the description:
-    #   "Cash Machine Withdrawal at 130.00 Notemachine Shell ..."
-    # The amount sits immediately after "at"; the trailing Money out /
-    # Balance column is unreliable on this layout (it commonly carries a
-    # fee or an empty column that the parser would otherwise pick as
-    # paid_out).
-    _CASH_MACHINE_INLINE_RE = re.compile(
-        r"(?:cash\s+machine\s+withdrawal|atm\s+withdrawal|cashpoint)"
-        r"\s+at\s+(\d{1,3}(?:,\d{3})*\.\d{2})\b",
-        re.IGNORECASE,
-    )
+    # Row types whose real debit lives inline in the description rather
+    # than the trailing Money out / Balance column.
+    _CASH_MACHINE_TYPES = ("cash_machine_withdrawal", "atm_withdrawal", "cashpoint")
+    _FX_CARD_TYPES = ("card_payment", "card_purchase")
     # Foreign-currency card payments: the trailing amount column carries
-    # only the non-sterling transaction fee. The actual GBP debit sits
-    # inline in the description, right after the payee name and before
-    # the country / foreign-currency tokens.
+    # only the non-sterling transaction fee. Detect the row by any of
+    # these markers anywhere in the row text.
     _FX_MARKERS = (
         "non-sterling transaction fee",
         "non sterling transaction fee",
@@ -1063,20 +1055,74 @@ class BarclaysStatementParser(BaseStatementParser):
         "exchange rate",
     )
 
-    def _inline_amount_override(self, body_text: str) -> Optional[Tuple[float, str]]:
+    def _inline_amount_override(
+        self,
+        body_text: str,
+        description: str,
+        derived_type: str,
+    ) -> Optional[Tuple[float, str]]:
         """Return ``(amount, source)`` when a Barclays row carries its real
-        debit amount inside the description (cash-machine / ATM and
-        foreign-currency card-payment formats). Returns ``None`` for the
-        default amounts-column behaviour."""
-        match = self._CASH_MACHINE_INLINE_RE.search(body_text)
-        if match:
-            return self._parse_money(match.group(1)), "cash_machine_inline"
-        lower = body_text.lower()
-        if any(marker in lower for marker in self._FX_MARKERS):
-            first = MONEY_TOKEN.search(body_text)
-            if first:
-                return self._parse_money(first.group(0)), "non_sterling_inline"
-        return None
+        debit amount inside the description.
+
+        Two patterns, both keyed off the row's ``derived_type`` so the
+        override never disturbs unrelated rows:
+
+        - ``cash_machine_withdrawal`` / ``atm_withdrawal`` / ``cashpoint``:
+          the withdrawal amount is an inline money token in the body
+          text; the largest inline token wins. Cash-machine rows commonly
+          carry a small fee in the trailing column that the default
+          longest-run logic was picking as ``paid_out``.
+
+        - ``card_payment`` / ``card_purchase`` with any FX marker
+          ("Non-Sterling Transaction Fee", "Final GBP Amount",
+          "Exchange Rate"): the GBP base amount is the first inline
+          money token AFTER the "Card Payment" phrase.
+
+        "Inline" = every money token except the trailing column. The
+        trailing column is identified positionally — the last money
+        token in body_text plus its immediate whitespace-adjacent
+        neighbour. This holds whether pdfplumber bunched the inline
+        amount into the same run as the column or split them, and even
+        if pdfplumber re-ordered the trailing column to appear before
+        the description.
+        """
+        is_cash_machine = derived_type in self._CASH_MACHINE_TYPES
+        is_fx_card = (
+            derived_type in self._FX_CARD_TYPES
+            and any(marker in body_text.lower() for marker in self._FX_MARKERS)
+        )
+        if not (is_cash_machine or is_fx_card):
+            return None
+
+        money_matches = list(MONEY_TOKEN.finditer(body_text))
+        if not money_matches:
+            return None
+
+        # Trailing column: last token + its whitespace-adjacent neighbour.
+        column_starts = {money_matches[-1].start()}
+        if len(money_matches) >= 2:
+            penult, last = money_matches[-2], money_matches[-1]
+            if body_text[penult.end():last.start()].strip() == "":
+                column_starts.add(penult.start())
+        inline_matches = [
+            m for m in money_matches if m.start() not in column_starts
+        ]
+        if not inline_matches:
+            return None
+
+        if is_cash_machine:
+            values = [self._parse_money(m.group(0)) for m in inline_matches]
+            return max(values), "cash_machine_inline"
+
+        # FX: prefer the first inline token AFTER the "Card Payment" /
+        # "Card Purchase" phrase, so pdfplumber's coordinate-sorted
+        # re-ordering of the trailing column doesn't shift the answer.
+        phrase = re.search(r"card\s+(?:payment|purchase)", body_text, re.IGNORECASE)
+        if phrase:
+            after = [m for m in inline_matches if m.start() > phrase.end()]
+            if after:
+                return self._parse_money(after[0].group(0)), "non_sterling_inline"
+        return self._parse_money(inline_matches[0].group(0)), "non_sterling_inline"
 
     def _diagnose_row(
         self,
@@ -1145,7 +1191,7 @@ class BarclaysStatementParser(BaseStatementParser):
         # Mirror the inline-amount override used by _build_transaction so
         # the balance_chain reflects what would actually be emitted.
         inline_source: Optional[str] = None
-        inline_override = self._inline_amount_override(joined)
+        inline_override = self._inline_amount_override(joined, description, derived_type)
         if inline_override is not None:
             paid_out, inline_source = inline_override[0], inline_override[1]
             paid_in = 0.0
@@ -1268,7 +1314,7 @@ class BarclaysStatementParser(BaseStatementParser):
         # rows whose trailing column carries only the fee). When detected,
         # the inline amount replaces paid_out — balance_after stays as
         # parsed from the trailing run.
-        inline_override = self._inline_amount_override(body_text)
+        inline_override = self._inline_amount_override(body_text, description, derived_type)
         inline_source: Optional[str] = None
         if inline_override is not None:
             inline_amount, inline_source = inline_override

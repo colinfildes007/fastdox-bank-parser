@@ -228,7 +228,7 @@ class BarclaysFixtureTests(unittest.TestCase):
     def test_health_lists_barclays_adapter(self):
         body = self.client.get("/health").json()
         self.assertIn("barclays_family_v1", body["available_adapters"])
-        self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.1.0")
+        self.assertEqual(body["adapter_versions"]["barclays_family_v1"], "1.1.1")
 
     def test_barclays_grouped_dates_and_credit_phrases(self):
         """Real Barclays statements group several transactions under a single
@@ -320,7 +320,7 @@ class BarclaysFixtureTests(unittest.TestCase):
         debug = body["parser_debug"]
         self.assertIn("deterministic_run_id", debug)
         self.assertIn("page_processing_order", debug)
-        self.assertEqual(debug["adapter_version"], "1.1.0")
+        self.assertEqual(debug["adapter_version"], "1.1.1")
         self.assertEqual(debug["credit_rows_returned"], 3)
         self.assertEqual(debug["debit_rows_returned"], 3)
         self.assertEqual(debug["credit_amount_sum"], 5215.65)
@@ -884,6 +884,148 @@ class BarclaysFixtureTests(unittest.TestCase):
         self.assertEqual(recon["status"], "matched")
         self.assertEqual(recon["calculated_total_debits"], 38.81)
         self.assertEqual(debug["balance_mismatch_rows"], [])
+
+    def test_barclays_cash_machine_inline_word_order_variants(self):
+        """v1.1.0's regex anchored on '<phrase> at {amount}' missed real
+        Barclays rows where pdfplumber's coordinate-sorted text didn't put
+        'at' immediately after the phrase. v1.1.1 keys off the row's
+        derived_type instead and takes the largest inline money token in
+        the description, so word order no longer matters.
+
+        Reproduces the page 10 mismatch where the override silently failed.
+        """
+        import fitz
+
+        # Several plausible orderings of the same cash-machine row. All
+        # must emit paid_out = 130.00 with inline_amount_source set.
+        layouts = [
+            # Word order 1: amount immediately after "at" (v1.1.0 caught this).
+            [
+                "15 Jun",
+                "Cash Machine Withdrawal at 130.00 Notemachine Shell Timed at On 15 Jun",
+                "0.79",
+                "49.26",
+            ],
+            # Word order 2: "at" is "Timed at", amount sits at the end of the
+            # description. v1.1.0 missed this — the regex anchor failed.
+            [
+                "15 Jun",
+                "Cash Machine Withdrawal Notemachine Shell Timed at On 15 Jun 130.00",
+                "0.79",
+                "49.26",
+            ],
+            # Word order 3: amount mid-description, no "at" anchor at all.
+            [
+                "15 Jun",
+                "Cash Machine Withdrawal Notemachine Shell 130.00 Timed at On 15 Jun",
+                "0.79",
+                "49.26",
+            ],
+        ]
+
+        for layout in layouts:
+            lines = [
+                "Barclays Bank UK PLC",
+                "Your Barclays Bank Account statement",
+                "Current account statement",
+                "Sort Code 20-55-59  Account Number 13604152",
+                "Statement period: 15 Jun - 15 Jun 2023",
+                "At a glance",
+                "Start balance       £180.05",
+                "Money in            £0.00",
+                "Money out           £130.79",
+                "End balance         £49.26",
+                "Your transactions",
+                *layout,
+            ]
+            info = ["Important information about your account"]
+            doc = fitz.open()
+            for block in (lines, info):
+                page = doc.new_page(width=720, height=80 + len(block) * 12 + 60)
+                y = 50
+                for line in block:
+                    page.insert_text((40, y), line, fontsize=8)
+                    y += 12
+
+            body = self._post_pdf(doc.write()).json()
+            cash = next(
+                (tx for tx in body["transactions"]
+                 if "cash machine" in tx["description_raw"].lower()),
+                None,
+            )
+            self.assertIsNotNone(cash, f"missing cash machine row for layout: {layout}")
+            self.assertEqual(
+                cash["paid_out"], 130.00,
+                f"layout {layout!r} produced paid_out {cash['paid_out']}",
+            )
+            self.assertEqual(cash["inline_amount_source"], "cash_machine_inline")
+
+    def test_barclays_non_sterling_fx_inline_word_order_variants(self):
+        """Non-sterling FX card payments may not always have a 'Card
+        Payment to' anchor immediately followed by the GBP amount. v1.1.1
+        relies on FX markers anywhere in the row text and takes the first
+        money token from the description (post-amounts-strip), so word
+        order doesn't matter.
+        """
+        import fitz
+
+        layouts = [
+            # Layout 1: amount immediately after payee — standard Barclays
+            # order. (v1.1.0 already handled this.)
+            [
+                "09 Jul",
+                "Card Payment to Curtis Technology 38.81 Nigeria USD 48.04",
+                "On 09 Jul at VISA Exchange Rate 1.27",
+                "The Final GBP Amount Includes A Non-Sterling Transaction Fee of",
+                "1.13",
+                "7.57",
+            ],
+            # Layout 2: the trailing column is bunched onto the same line
+            # as the description's last token. The longest-run amount logic
+            # absorbs the inline 38.81 — v1.1.0 returned the trailing fee
+            # as paid_out; v1.1.1 uses positional column detection so 38.81
+            # is still picked out.
+            [
+                "09 Jul",
+                "Card Payment to Curtis Technology 38.81 Nigeria USD 48.04",
+                "On 09 Jul at VISA Exchange Rate 1.27",
+                "The Final GBP Amount Includes A Non-Sterling Transaction Fee of 1.13 7.57",
+            ],
+        ]
+
+        for layout in layouts:
+            lines = [
+                "Barclays Bank UK PLC",
+                "Your Barclays Bank Account statement",
+                "Current account statement",
+                "Sort Code 20-55-59  Account Number 13604152",
+                "Statement period: 09 Jul - 09 Jul 2023",
+                "At a glance",
+                "Start balance       £46.38",
+                "Money in            £0.00",
+                "Money out           £38.81",
+                "End balance         £7.57",
+                "Your transactions",
+                *layout,
+            ]
+            info = ["Important information about your account"]
+            doc = fitz.open()
+            for block in (lines, info):
+                page = doc.new_page(width=720, height=80 + len(block) * 12 + 60)
+                y = 50
+                for line in block:
+                    page.insert_text((40, y), line, fontsize=8)
+                    y += 12
+
+            body = self._post_pdf(doc.write()).json()
+            curtis = next(
+                (tx for tx in body["transactions"]
+                 if "curtis technology" in tx["description_raw"].lower()),
+                None,
+            )
+            self.assertIsNotNone(curtis, f"missing FX row for layout: {layout}")
+            self.assertEqual(curtis["paid_out"], 38.81)
+            self.assertEqual(curtis["inline_amount_source"], "non_sterling_inline")
 
     def test_barclays_detected_even_with_noisy_other_bank_mentions(self):
         """A bare 'santander' or 'lloyds' mention buried in a Barclays
