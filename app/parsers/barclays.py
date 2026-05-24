@@ -115,7 +115,7 @@ class BarclaysStatementParser(BaseStatementParser):
     bank_name = "Barclays"
     parser_name = "barclays_family_text_v1"
     parser_adapter = "barclays_family_v1"
-    adapter_version = "1.0.5"
+    adapter_version = "1.0.6"
 
     def can_parse(self, context: Dict) -> bool:
         hint = (context.get("bank_hint") or "").lower()
@@ -165,6 +165,7 @@ class BarclaysStatementParser(BaseStatementParser):
         per_page = []
         per_page_credit_sums: Dict[str, float] = {}
         per_page_debit_sums: Dict[str, float] = {}
+        per_page_totals: Dict[str, Dict] = {}
         for stat in page_stats:
             page_number = stat["page_number"]
             page_txns = [t for t in transactions if t.get("page_number") == page_number]
@@ -181,6 +182,13 @@ class BarclaysStatementParser(BaseStatementParser):
             )
             per_page_credit_sums[str(page_number)] = credit_sum
             per_page_debit_sums[str(page_number)] = debit_sum
+            per_page_totals[str(page_number)] = {
+                "paid_in": credit_sum,
+                "paid_out": debit_sum,
+                "transaction_count": len(page_txns),
+                "candidate_rows": stat.get("candidate_rows", 0),
+                "rejected_rows": stat.get("rejected_rows", 0),
+            }
 
         # Targeted diagnostic slices for inspecting reconciliation deltas.
         transactions_on_2023_05_26 = [
@@ -372,6 +380,15 @@ class BarclaysStatementParser(BaseStatementParser):
             "all_rejected_candidate_rows": parse_debug["all_rejected"],
             "debit_delta": debit_delta,
             "credit_delta": credit_delta,
+            "per_page_totals": per_page_totals,
+            "expected_vs_actual": {
+                "statement_total_credits": statement_total_credits,
+                "calculated_total_credits": calculated_total_credits,
+                "credit_difference": credit_delta,
+                "statement_total_debits": statement_total_debits,
+                "calculated_total_debits": calculated_total_debits,
+                "debit_difference": debit_delta,
+            },
             "rows_near_missing_debit": rows_near_missing_debit,
             "possible_debit_as_balance_rows": possible_debit_as_balance_rows,
             "per_page_rejected_debit_sums": per_page_rejected_debit_sums,
@@ -495,7 +512,12 @@ class BarclaysStatementParser(BaseStatementParser):
 
             if anchor_page is None or page_number is None or page_number < anchor_page or stop_reached:
                 pages_skipped.append(page_number)
-                page_stats.append({"page_number": page_number, "transaction_rows": 0})
+                page_stats.append({
+                    "page_number": page_number,
+                    "transaction_rows": 0,
+                    "candidate_rows": 0,
+                    "rejected_rows": 0,
+                })
                 continue
 
             if page_number == anchor_page:
@@ -514,7 +536,12 @@ class BarclaysStatementParser(BaseStatementParser):
 
             if not section_text.strip():
                 pages_skipped.append(page_number)
-                page_stats.append({"page_number": page_number, "transaction_rows": 0})
+                page_stats.append({
+                    "page_number": page_number,
+                    "transaction_rows": 0,
+                    "candidate_rows": 0,
+                    "rejected_rows": 0,
+                })
                 continue
 
             pages_considered.append(page_number)
@@ -576,8 +603,17 @@ class BarclaysStatementParser(BaseStatementParser):
                 pages_with_rows.append(page_number)
 
             transactions.extend(page_rows)
+            page_rejected_count = sum(
+                1 for sample in all_rejected
+                if sample.get("page_number") == page_number
+            )
             page_stats.append(
-                {"page_number": page_number, "transaction_rows": len(page_rows)}
+                {
+                    "page_number": page_number,
+                    "transaction_rows": len(page_rows),
+                    "candidate_rows": len(rows),
+                    "rejected_rows": page_rejected_count,
+                }
             )
 
         return transactions, page_stats, debug
